@@ -203,6 +203,39 @@ handle.disable();
 # }
 ```
 
+### Multiple runtimes
+
+For applications with multiple tokio runtimes (e.g. thread-per-core, or separate request/IO runtimes), use `TelemetryCore` to create the telemetry session first, then attach each runtime:
+
+```rust,no_run
+# use dial9_tokio_telemetry::telemetry::{RotatingWriter, TelemetryCore};
+# fn main() -> std::io::Result<()> {
+# let writer = RotatingWriter::new("/tmp/t.bin", 1024, 4096)?;
+let guard = TelemetryCore::builder()
+    .writer(writer)
+    .trace_path("/tmp/t.bin")
+    .build()?;
+guard.enable();
+
+let mut main_builder = tokio::runtime::Builder::new_multi_thread();
+main_builder.worker_threads(4).enable_all();
+let (main_rt, main_handle) = guard.trace_runtime("main").build(main_builder)?;
+
+let mut io_builder = tokio::runtime::Builder::new_multi_thread();
+io_builder.worker_threads(2).enable_all();
+let (io_rt, io_handle) = guard.trace_runtime("io").build(io_builder)?;
+
+// Both runtimes share a single trace file with unique worker IDs.
+// The trace viewer groups workers by runtime name.
+// Use main_handle.spawn() / io_handle.spawn() for wake-tracked futures.
+# Ok(())
+# }
+```
+
+See [`examples/thread_per_core.rs`](/dial9-tokio-telemetry/examples/thread_per_core.rs) and [`examples/multi_runtime.rs`](/dial9-tokio-telemetry/examples/multi_runtime.rs) for complete examples.
+
+**Shutdown**: Drop all runtimes before the `TelemetryGuard` so worker threads exit and flush their thread-local buffers. For a clean shutdown that waits for the background worker (e.g. S3 uploads) to drain, call `guard.graceful_shutdown(timeout)` instead of dropping the guard.
+
 ### Writers
 
 `RotatingWriter` rotates files based on size and time, and evicts old ones to stay within a total size budget. By default, segments rotate every 60 seconds (wall-clock-aligned) or when they exceed `max_file_size`, whichever comes first. For quick experiments, `RotatingWriter::single_file(path)` writes a single file with no rotation.
