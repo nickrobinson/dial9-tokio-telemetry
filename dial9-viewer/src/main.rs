@@ -18,7 +18,7 @@ mod skills {
 #[derive(Parser, Debug)]
 #[command(
     name = "dial9-viewer",
-    about = "S3 trace browser and viewer for dial9-tokio-telemetry"
+    about = "Trace browser and viewer for dial9-tokio-telemetry"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -36,6 +36,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     prefix: Option<String>,
 
+    /// Serve traces from a local directory instead of S3
+    #[arg(long, global = true, conflicts_with = "bucket")]
+    local_dir: Option<PathBuf>,
+
     /// Directory containing UI static files (when running without a subcommand)
     #[arg(long, default_value = "ui", global = true)]
     ui_dir: PathBuf,
@@ -49,23 +53,7 @@ enum Commands {
         action: Option<AgentsAction>,
     },
     /// Start the web server
-    Serve {
-        /// Port to listen on
-        #[arg(long, default_value = "3000")]
-        port: u16,
-
-        /// S3 bucket name (if omitted, bucket must be specified per-request)
-        #[arg(long)]
-        bucket: Option<String>,
-
-        /// S3 key prefix to filter traces
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// Directory containing UI static files
-        #[arg(long, default_value = "ui")]
-        ui_dir: PathBuf,
-    },
+    Serve {},
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,13 +98,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         },
-        Some(Commands::Serve {
-            port,
-            bucket,
-            prefix,
-            ui_dir,
-        }) => return serve(port, bucket, prefix, ui_dir).await,
-        None => return serve(cli.port, cli.bucket, cli.prefix, cli.ui_dir).await,
+        Some(Commands::Serve {}) | None => {
+            return serve(cli.port, cli.bucket, cli.prefix, cli.local_dir, cli.ui_dir).await;
+        }
     }
     Ok(())
 }
@@ -125,6 +109,7 @@ async fn serve(
     port: u16,
     bucket: Option<String>,
     prefix: Option<String>,
+    local_dir: Option<PathBuf>,
     ui_dir: PathBuf,
 ) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -147,19 +132,33 @@ async fn serve(
         ui_dir
     };
 
-    let backend = dial9_viewer::storage::S3Backend::from_env().await;
-    let app_state = dial9_viewer::server::AppState::new(
-        std::sync::Arc::new(backend),
-        bucket.clone(),
-        prefix.clone(),
-    );
+    let app_state = if let Some(dir) = &local_dir {
+        let dir = std::fs::canonicalize(dir)?;
+        tracing::info!(path = %dir.display(), "serving traces from local directory");
+        let backend = dial9_viewer::storage::LocalBackend::new(&dir);
+        // Use a sentinel bucket so routes that require one don't fail.
+        dial9_viewer::server::AppState::new(
+            std::sync::Arc::new(backend),
+            Some("local".into()),
+            prefix.clone(),
+        )
+    } else {
+        let backend = dial9_viewer::storage::S3Backend::from_env().await;
+        dial9_viewer::server::AppState::new(
+            std::sync::Arc::new(backend),
+            bucket.clone(),
+            prefix.clone(),
+        )
+    };
 
     let app = dial9_viewer::server::router(app_state, &ui_dir);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, ui_dir = %ui_dir.display(), "dial9-viewer listening");
     println!("\n  → http://localhost:{}\n", port);
-    if let Some(bucket) = &bucket {
+    if let Some(dir) = &local_dir {
+        tracing::info!(path = %dir.display(), "local directory mode");
+    } else if let Some(bucket) = &bucket {
         tracing::info!(%bucket, "default bucket");
     }
 
