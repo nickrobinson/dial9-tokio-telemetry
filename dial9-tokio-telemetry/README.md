@@ -24,6 +24,44 @@ Without this flag, compilation will fail with errors about missing methods on `t
 
 ## Quick start
 
+There are two ways to set up dial9: the `#[main]` macro (recommended for most apps) or manual `TracedRuntime` setup. The macro handles the boilerplate of building the runtime and spawning your code as an instrumented task. Inside the body, call `TelemetryHandle::current()` to reach a handle for wake-event tracking. Use manual setup when you have multiple tokio runtimes, don't own main (e.g. library code, embedded services), or need to integrate into existing runtime-building code.
+
+### Using the `#[main]` macro
+
+> **Note:** `#[dial9_tokio_telemetry::main]` is a **replacement** for `#[tokio::main]`, not a complement — do not use both on the same function. The macro builds and configures the Tokio runtime internally.
+
+```rust,no_run
+use dial9_tokio_telemetry::{main, config::{Dial9Config, Dial9ConfigBuilder}, telemetry::TelemetryHandle};
+
+fn my_config() -> Dial9Config {
+    Dial9ConfigBuilder::new(
+        "/tmp/my_traces/trace.bin",
+        1024 * 1024,      // rotate after 1 MiB per file
+        5 * 1024 * 1024,  // keep at most 5 MiB on disk
+    )
+    .rotation_period(std::time::Duration::from_secs(300)) // optional: rotate every 5 min (default: 60 s)
+    .with_runtime(|r| r.with_runtime_name("main").with_task_tracking(true))  // TracedRuntime knobs
+    .with_tokio(|t| { t.worker_threads(4); }) // tokio knobs
+    .build()
+}
+
+#[dial9_tokio_telemetry::main(config = my_config)]
+async fn main() {
+    // your async code here
+    // `TelemetryHandle::current()` reaches the per-thread handle for
+    // spawning instrumented sub-tasks:
+    let handle = TelemetryHandle::current();
+    handle
+        .spawn(async { /* wake events tracked */ })
+        .await
+        .unwrap();
+}
+```
+
+The macro automatically spawns your function body as a task, so top-level code is visible in traces (unlike plain `#[tokio::main]` where `block_on` work is invisible — see [below](#the-root-future-is-not-instrumented)). On every runtime-owned thread, dial9 installs a `TelemetryHandle` via `on_thread_start` — `TelemetryHandle::current()` returns it for spawning sub-tasks with wake-event tracking.
+
+### Manual setup
+
 ```rust
 use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
 
@@ -38,10 +76,13 @@ fn main() -> std::io::Result<()> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_all();
 
-    let (runtime, _guard) = TracedRuntime::build_and_start(builder, writer)?;
+    let (runtime, guard) = TracedRuntime::build_and_start(builder, writer)?;
+    let handle = guard.handle();
 
     runtime.block_on(async {
-        // your async code here
+        handle.spawn(async {
+            // your async code here will be instrumented
+        }).await.unwrap();
     });
 
     Ok(())
@@ -50,39 +91,56 @@ fn main() -> std::io::Result<()> {
 
 Events are 6–16 bytes on the wire, and a typical request generates ~20–35 bytes of trace data (a few poll events plus park/unpark). At 10k requests/sec that's well under 1 MB/s — `RotatingWriter` caps total disk usage so you can leave it running indefinitely. Typical CPU overhead is under 5%.
 
-Segments rotate on size *or* time, whichever comes first. Time boundaries are wall-clock-aligned (e.g. a 60 s period rotates at the top of each minute), which produces clean S3 key paths when using the `worker-s3` feature.
+Segments rotate on size _or_ time, whichever comes first. Time boundaries are wall-clock-aligned (e.g. a 60 s period rotates at the top of each minute), which produces clean S3 key paths when using the `worker-s3` feature.
 
 ## Can I use this in prod?
+
 dial9-tokio-telemetry is designed for always-on production use, but it's still early software. Measure overhead and validate behavior in your environment before deploying to production.
 
 ## Is there a demo?
+
 Yes, checkout this [quick walkthrough (YouTube)](https://www.youtube.com/watch?v=zJOzU_6Mf7Q)!
 
 The [viewer](https://dial9-tokio-telemetry.netlify.app/) (autodeployed from code in `main`) is hosted on Netlify for convenience. You can [load the demo trace](https://dial9-tokio-telemetry.netlify.app/?trace=demo-trace.bin) directly, or use [serve.py](/dial9-tokio-telemetry/serve.py) to run it locally (pure HTML and JS, client side only).
 
 <img width="1288" height="659" alt="Screenshot 2026-03-01 at 3 52 59 PM" src="https://github.com/user-attachments/assets/77225801-70b1-4aef-b064-32bc2326b1ef" />
 
-
 ## Why dial9-tokio-telemetry?
 
 It can be hard to understand application performance and behavior, in async code. Dial9 tracks every event Tokio emits to create a detailed, micro-second-by-microsecond trace of your application behavior that you can analyze.
 
-Compared to [tokio-console](https://github.com/tokio-rs/console), which is designed for live debugging, dial9-tokio-telemetry is designed for post-hoc analysis. Because traces are written to files with bounded disk usage, you can leave it running in production and come back later to deeply analyze what went wrong or why a specific request was slow. On Linux, traces include CPU profile samples and kernel scheduling events, so you can see not just *that* a task was delayed but *what code* was running on the worker instead.
+Compared to [tokio-console](https://github.com/tokio-rs/console), which is designed for live debugging, dial9-tokio-telemetry is designed for post-hoc analysis. Because traces are written to files with bounded disk usage, you can leave it running in production and come back later to deeply analyze what went wrong or why a specific request was slow. On Linux, traces include CPU profile samples and kernel scheduling events, so you can see not just _that_ a task was delayed but _what code_ was running on the worker instead.
 
 ## What gets recorded automatically
 
 `TracedRuntime` installs hooks on the Tokio runtime. The following events are recorded out of the box:
 
-| Event | Fields |
-|-------|--------|
-| `PollStart` / `PollEnd` | timestamp, worker, task ID, spawn location, local queue depth |
-| `WorkerPark` / `WorkerUnpark` | timestamp, worker, local queue depth, thread CPU time, schedstat wait |
-| `QueueSample` | timestamp, global queue depth (sampled every 10 ms) |
-| `TaskSpawn` / `SpawnLocationDef` | task→spawn-location mapping (when `task_tracking` is enabled) |
+| Event                            | Fields                                                                |
+| -------------------------------- | --------------------------------------------------------------------- |
+| `PollStart` / `PollEnd`          | timestamp, worker, task ID, spawn location, local queue depth         |
+| `WorkerPark` / `WorkerUnpark`    | timestamp, worker, local queue depth, thread CPU time, schedstat wait |
+| `QueueSample`                    | timestamp, global queue depth (sampled every 10 ms)                   |
+| `TaskSpawn` / `SpawnLocationDef` | task→spawn-location mapping (when `task_tracking` is enabled)         |
+
+## The root future is not instrumented
+
+Tokio's runtime hooks only fire for _spawned_ tasks. The future you pass to `runtime.block_on(...)` is not a spawned task, so code that runs directly in it produces no `PollStart` / `PollEnd` events and is invisible to dial9. This includes everything at the top level of `#[tokio::main]`.
+
+To make work visible, spawn it:
+
+```rust,ignore
+runtime.block_on(async {
+    // Not instrumented — runs on the block_on root future.
+    do_setup().await;
+
+    // Instrumented — this task shows up in the trace.
+    handle.spawn(async { do_real_work().await }).await.unwrap();
+});
+```
 
 ## Wake event tracking
 
-To understand when Tokio itself is delaying your code, generally referred to as scheduler delay, you need to know when your future was _ready_ to run. Wake events — which task woke which other task — are *not* captured automatically. Tokio's runtime hooks don't currently allow instrumenting wakes: capturing wakes requires wrapping the future. The simplest way to do that is by using `handle.spawn` instead of `task::spawn`. 
+To understand when Tokio itself is delaying your code, generally referred to as scheduler delay, you need to know when your future was _ready_ to run. Wake events — which task woke which other task — are _not_ captured automatically. Tokio's runtime hooks don't currently allow instrumenting wakes: capturing wakes requires wrapping the future. The simplest way to do that is by using `handle.spawn` instead of `task::spawn`.
 
 Use `handle.spawn()` instead of `tokio::spawn()`:
 
@@ -148,6 +206,7 @@ Custom events are encoded into the same thread-local buffer as built-in events (
 Core telemetry (poll timing, park/unpark, queue depth, wake events) works on all platforms.
 
 On Linux, you get additional data for free:
+
 - **Thread CPU time** in park/unpark events via `CLOCK_THREAD_CPUTIME_ID` (vDSO, ~20–40 ns)
 - **Scheduler wait time** via `/proc/self/task/<tid>/schedstat` — shows when the Tokio worker was not scheduled by the OS when it was ready.
 
@@ -156,6 +215,7 @@ On non-Linux platforms these fields are zero.
 ### CPU profiling (Linux only)
 
 With the `cpu-profiling` feature, you can enable `perf_event_open`-based CPU sampling. This gives two key pieces of data:
+
 1. Stack traces when code was running on the CPU — aka flamegraphs
 2. Stack traces when the kernel _descheduled_ your thread. For example, if you use `std::thread::sleep` in your future or are seeing `std::sync::Mutex` contention, this will allow you to see precisely where this is happening in async code.
 
@@ -204,6 +264,7 @@ sudo sysctl kernel.perf_event_paranoid=1
 ```
 
 **`kallsyms`**: Resolving kernel addresses requires `kptr_restrict == 0` for non-root, or else they will show up like: `[kernel] 0xffffffff81336901`:
+
 ```bash
 # check current value
 cat /proc/sys/kernel/kptr_restrict
@@ -299,7 +360,7 @@ See [TRACE_ANALYSIS_GUIDE.md](/dial9-tokio-telemetry/TRACE_ANALYSIS_GUIDE.md) fo
 
 With the `worker-s3` feature, sealed trace segments are automatically gzip-compressed and uploaded to S3 by a background worker thread. The application process is unaffected: uploads happen asynchronously after segments are sealed.
 
-Only `bucket` and `service_name` are required. See [`S3Config`](https://docs.rs/dial9-tokio-telemetry/latest/dial9_tokio_telemetry/background_task/s3/struct.S3Config.html) for additional options.
+Only `bucket` and `service_name` are required. See `S3Config` for additional options.
 
 ```rust,no_run
 # #[cfg(feature = "worker-s3")]
@@ -348,10 +409,12 @@ The worker uses a circuit breaker with exponential backoff if S3 is unreachable.
 ## Examples
 
 ```bash
-cargo run --example telemetry_rotating   # rotating writer demo
-cargo run --example simple_workload      # basic instrumented workload
-cargo run --example realistic_workload   # mixed CPU/IO workload
-cargo run --example long_workload        # longer run for trace analysis
+cargo run --example simple_workload        # macro-based setup (start here)
+cargo run --example conditionally_enable   # toggle telemetry via ENABLE_DIAL9 env var
+cargo run --example realistic_workload     # mixed CPU/IO workload
+cargo run --example long_workload          # longer run for trace analysis
+cargo run --example telemetry_rotating     # manual setup + rotating writer config
+cargo run --example multi_runtime          # multiple runtimes, manual TelemetryCore
 ```
 
 The [`examples/metrics-service`](/examples/metrics-service) directory has a full Axum service with DynamoDB persistence, a load-generating client, and telemetry wired up end-to-end.
@@ -372,9 +435,10 @@ Overhead:   3.2%
 
 ## Workspace
 
-This repo is a Cargo workspace with three members:
+This repo is a Cargo workspace with four members:
 
 - [`dial9-tokio-telemetry`](/dial9-tokio-telemetry) — the main crate
+- [`dial9-macro`](/dial9-macro) — the `#[dial9_tokio_telemetry::main]` attribute macro
 - [`dial9-perf-self-profile`](/perf-self-profile) — minimal Linux `perf_event_open` wrapper for CPU profiling and scheduler events
 - [`examples/metrics-service`](/examples/metrics-service) — end-to-end example service
 

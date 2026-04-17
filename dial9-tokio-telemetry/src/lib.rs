@@ -18,3 +18,8 @@ pub(crate) mod rate_limit;
 /// Core telemetry types, recording, and trace I/O.
 pub mod telemetry;
 pub(crate) mod traced;
+
+/// Unified configuration for the [`main`] macro.
+pub mod config;
+
+pub use dial9_macro::main;
