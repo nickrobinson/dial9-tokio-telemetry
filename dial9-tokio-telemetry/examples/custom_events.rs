@@ -20,14 +20,17 @@ use std::time::Duration;
 
 // ── Simple: derive-only, no interning ───────────────────────────────────────
 
-/// A custom event with only primitive fields. The blanket `Encodable` impl
+/// A custom event with primitive and optional fields. The blanket `Encodable` impl
 /// handles encoding automatically — just pass it to `record_event`.
+/// Optional fields use 1 byte on the wire when absent (None).
 #[derive(TraceEvent)]
 struct RequestCompleted {
     #[traceevent(timestamp)]
     timestamp_ns: u64,
     status_code: u32,
     latency_us: u64,
+    /// Only present for failed requests.
+    error_message: Option<String>,
 }
 
 // ── Advanced: manual Encodable with string interning ────────────────────────
@@ -71,13 +74,19 @@ fn main() -> std::io::Result<()> {
     let handle = guard.handle();
 
     runtime.block_on(async {
-        // Simple: derive-only events
+        // Simple: derive-only events (some with optional field present)
         for i in 0..10 {
+            let error_message = if i % 4 == 3 {
+                Some(format!("timeout after {}ms", 100 + i))
+            } else {
+                None
+            };
             record_event(
                 RequestCompleted {
                     timestamp_ns: clock_monotonic_ns(),
-                    status_code: 200,
+                    status_code: if error_message.is_some() { 500 } else { 200 },
                     latency_us: 100 + i,
+                    error_message,
                 },
                 &handle,
             );

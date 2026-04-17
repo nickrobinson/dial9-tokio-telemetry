@@ -122,6 +122,8 @@ struct RequestCompleted {
     timestamp_ns: u64,
     status_code: u32,
     latency_us: u64,
+    /// Optional fields use 1 byte on the wire when absent.
+    error_message: Option<String>,
 }
 
 # let handle: TelemetryHandle = todo!();
@@ -130,6 +132,7 @@ record_event(
         timestamp_ns: clock_monotonic_ns(),
         status_code: 200,
         latency_us: 1500,
+        error_message: None,
     },
     &handle,
 );
