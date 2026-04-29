@@ -16,7 +16,7 @@ rustc-args = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
 all-features = true
 
 [dependencies]
-tokio = { version = "1.51.0", features = ["rt", "macros", "time", "rt-multi-thread", "sync", "net", "io-util"] }
+tokio = { version = "1.48.0", features = ["rt", "macros", "time", "rt-multi-thread", "sync", "net", "io-util"] }
 tokio-util = "0.7"
 arc-swap = "1"
 crossbeam-queue = "0.3"
@@ -56,7 +56,7 @@ clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 metrique-timesource = { version = "0.1", features = ["custom-timesource", "tokio"] }
 metrique-writer = { version = "0.1", features = ["test-util"] }
-tokio = { version = "1.51.0", features = ["test-util"] }
+tokio = { version = "1.48.0", features = ["test-util"] }
 proptest = "1"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
