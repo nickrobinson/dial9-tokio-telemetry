@@ -78,8 +78,10 @@ impl RuntimeContext {
     }
 
     /// Resolve the current thread's global worker ID using `tokio::runtime::worker_index()`.
+    ///
+    /// Falls back to `None` when built against tokio < 1.51 which lacks the API.
     fn resolve_worker(&self, shared: &SharedState) -> Option<(WorkerId, usize)> {
-        let local_index = tokio::runtime::worker_index()?;
+        let local_index = worker_index_compat()?;
         let (_, base) = self.metrics_and_base.get()?;
         let global_id = base + local_index as u64;
 
@@ -122,6 +124,20 @@ fn register_tid_if_needed(global_id: u64, shared: &SharedState) {
             cell.set(true);
         }
     });
+}
+
+/// Compatibility wrapper for `tokio::runtime::worker_index()`.
+///
+/// Returns `Some(index)` on tokio >= 1.51 (with the `tokio-worker-index` feature),
+/// `None` otherwise.
+#[cfg(feature = "tokio-worker-index")]
+fn worker_index_compat() -> Option<usize> {
+    tokio::runtime::worker_index()
+}
+
+#[cfg(not(feature = "tokio-worker-index"))]
+fn worker_index_compat() -> Option<usize> {
+    None
 }
 
 /// Get the current thread's global worker ID.
