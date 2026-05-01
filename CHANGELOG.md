@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Inline config in the macro**: `#[dial9_tokio_telemetry::main]` now accepts a closure, so simple setups no longer need a separate config function.
+- **Fluent config builder**: `Dial9Config::builder()` with named setters, `with_tokio`/`with_runtime` closures, and `.enabled(bool)`. The original positional API under `dial9_tokio_telemetry::config` is unchanged.
+- **`build_or_disabled()`**: on config validation or writer I/O failure, logs an error and starts a plain tokio runtime instead of crashing. Use `build()` to handle failures explicitly.
+
+All three in action:
+
+  ```rust
+  #[dial9_tokio_telemetry::main(config = || {
+      Dial9Config::builder()
+          .base_path("/tmp/trace.bin")
+          .max_file_size(64 * 1024 * 1024)
+          .max_total_size(256 * 1024 * 1024)
+          .build_or_disabled()
+  })]
+  async fn main() { /* ... */ }
+  ```
+
+### Changed
+
+- `TelemetryHandle::current()` no longer panics off-runtime. It returns an inert handle whose `spawn` falls through to `tokio::spawn`. Use `TelemetryHandle::is_enabled()` to check whether telemetry is live.
+
 ## [0.3.6](https://github.com/dial9-rs/dial9-tokio-telemetry/compare/dial9-tokio-telemetry-v0.3.5...dial9-tokio-telemetry-v0.3.6) - 2026-04-30
 
 ### Added
@@ -97,13 +120,13 @@ tracing_subscriber::registry()
     .init();
 ```
 
-Tracing support means you can attach a request ID or other context to spans via `#[instrument(fields(request_id = %id))]` and then search for specific requests in the trace. You can also see what's happening inside long polls: if a single poll contains many small operations without yielding, the span breakdown shows exactly where the time went. 
+Tracing support means you can attach a request ID or other context to spans via `#[instrument(fields(request_id = %id))]` and then search for specific requests in the trace. You can also see what's happening inside long polls: if a single poll contains many small operations without yielding, the span breakdown shows exactly where the time went.
 
 Standard `tracing-subscriber` filtering rules apply. Without a filter, libraries like the AWS SDK will flood the trace with internal spans. The preceding captures only spans from `my_app`.
 
 ## [0.3.0](https://github.com/dial9-rs/dial9-tokio-telemetry/compare/dial9-tokio-telemetry-v0.2.0...dial9-tokio-telemetry-v0.3.0) - 2026-04-17
 
-Big release. The setup story is much better, there's support for tracing multiple runtimes, you can emit your own events into the trace, and the viewer is its own crate now. 
+Big release. The setup story is much better, there's support for tracing multiple runtimes, you can emit your own events into the trace, and the viewer is its own crate now.
 
 ### `#[dial9_tokio_telemetry::main]` macro ([#212](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/212))
 
@@ -227,6 +250,7 @@ Uncompressed trace files can be concatenated (`cat trace.0.bin trace.1.bin > com
 ## [0.2.0](https://github.com/dial9-rs/dial9-tokio-telemetry/compare/dial9-tokio-telemetry-v0.1.1...dial9-tokio-telemetry-v0.2.0) - 2026-03-20
 
 0.2.0 brings two major improvements:
+
 1. Support for publishing traces to S3
 2. Migration to the new trace format (dial9-trace-format). This format is self describing, extremely compact, compressible and fast to write. This will set us up to easily add application level telemetry in the future.
 
@@ -246,15 +270,15 @@ For setting it up in production applications, the new `.install(true/false)` met
 - Bring back support for locations in offline symbolization ([#110](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/110))
 - stop writing trailing garbage in gzip segments after graceful_shutdown ([#104](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/104))
 - Fix worker spin-loop on gzip-compressed and permanently failing segments ([#102](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/102))
-- *(trace_viewer)* update format name from TOKIOTRC to D9TF in landing screen ([#103](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/103))
-- *(js-decoder)* handle truncated frames gracefully, read symbol frames even if >= MAX_EVENTS ([#98](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/98))
+- _(trace_viewer)_ update format name from TOKIOTRC to D9TF in landing screen ([#103](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/103))
+- _(js-decoder)_ handle truncated frames gracefully, read symbol frames even if >= MAX_EVENTS ([#98](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/98))
 - clarify S3 key layout is the default, not the only option ([#89](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/89))
 - add missing crates.io metadata ([#84](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/84))
 - thread-local buffer not flushing on drop ([#54](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/54))
 
 ### Other
 
-- *(trace-parser)* consolidate per-branch cap checks into early continue ([#116](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/116))
+- _(trace-parser)_ consolidate per-branch cap checks into early continue ([#116](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/116))
 - fix flaky worker park test ([#117](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/117))
 - Harden flush path with ArrayQueue & emit metrics ([#97](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/97))
 - Update demo trace to have symbols ([#105](https://github.com/dial9-rs/dial9-tokio-telemetry/pull/105))
