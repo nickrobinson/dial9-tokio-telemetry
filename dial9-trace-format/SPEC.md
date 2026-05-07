@@ -38,7 +38,7 @@ Every frame begins with a 1-byte tag:
 | `0x03` | String Pool |
 | `0x04` | Stack Pool |
 | `0x05` | Timestamp Reset |
-| `0x06` | *(reserved)* |
+| `0x06` | Schema Annotations |
 
 Unknown tags **must** cause the decoder to stop (the stream cannot be advanced without knowing the frame size).
 
@@ -149,6 +149,31 @@ Resets the running timestamp base used for packed event timestamps. The encoder 
 Total: **9 bytes**.
 
 After decoding this frame, the decoder sets `timestamp_base_ns = timestamp_ns`. The next event's `timestamp_delta_ns` is relative to this new base.
+
+### Schema Annotations Frame (`0x06`)
+
+Carries per-field metadata for a previously-registered schema. Annotations are key-value string pairs attached to individual fields by index. A schema with no annotations produces no annotation frame.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| tag | u8 | `0x06` |
+| type_id | LEB128 u64 | References a schema's `type_id` (varint-encoded to allow future overflow beyond u16) |
+| count | u16 | Number of annotation entries |
+| entries | [FieldAnnotation; count] | Annotation entries (see below) |
+
+Each **FieldAnnotation**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| field_index | u16 | Index into the schema's field list (0-based) |
+| key_len | u16 | Length of key in bytes |
+| key | [u8; key_len] | UTF-8 annotation key (e.g. `metrique.unit`) |
+| value_len | u32 | Length of value in bytes |
+| value | [u8; value_len] | UTF-8 annotation value (e.g. `microseconds`) |
+
+Multiple annotation frames for the same `type_id` are permitted; the decoder accumulates entries. The encoder typically emits one annotation frame immediately after the schema frame it annotates, but the format does not mandate ordering beyond the requirement that the referenced `type_id` must already be registered.
+
+A decoder that encounters an annotation frame referencing an unknown `type_id` may skip it leniently (the annotations have nowhere to attach).
 
 ## Field Types
 

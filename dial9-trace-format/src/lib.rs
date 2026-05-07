@@ -70,6 +70,7 @@ pub trait TraceEvent {
             name: Self::event_name().to_string(),
             has_timestamp: Self::has_timestamp(),
             fields: Self::field_defs(),
+            annotations: Vec::new(),
         }
     }
 }
