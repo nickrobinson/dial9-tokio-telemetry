@@ -14,7 +14,21 @@ use super::fp_profiler::{
 };
 use super::gettid;
 
+#[cfg(target_os = "linux")]
 use libc::{timer_getoverrun, timer_settime};
+
+// Bionic exposes these but the Rust `libc` crate doesn't bind them yet.
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn timer_getoverrun(timerid: libc::timer_t) -> libc::c_int;
+    fn timer_settime(
+        timerid: libc::timer_t,
+        flags: libc::c_int,
+        new_value: *const libc::itimerspec,
+        old_value: *mut libc::itimerspec,
+    ) -> libc::c_int;
+}
+
 use super::sampler::SamplerBackend;
 
 use crate::sampler::{Sample, SamplerConfig};

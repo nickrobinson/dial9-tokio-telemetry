@@ -31,7 +31,25 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crate::sys::linux::gettid;
 
+#[cfg(target_os = "linux")]
 use libc::{timer_create, timer_delete, timer_settime};
+
+// Bionic exposes these but the Rust `libc` crate doesn't bind them yet.
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn timer_create(
+        clockid: libc::clockid_t,
+        sevp: *mut libc::sigevent,
+        timerid: *mut libc::timer_t,
+    ) -> libc::c_int;
+    fn timer_delete(timerid: libc::timer_t) -> libc::c_int;
+    fn timer_settime(
+        timerid: libc::timer_t,
+        flags: libc::c_int,
+        new_value: *const libc::itimerspec,
+        old_value: *mut libc::itimerspec,
+    ) -> libc::c_int;
+}
 
 static INTERVAL_NS: AtomicI64 = AtomicI64::new(0);
 /// Whether sampling is currently enabled. Toggled by `disable`/`enable`.
