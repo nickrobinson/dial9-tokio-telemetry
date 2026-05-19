@@ -5,7 +5,6 @@ use serde::Serialize;
 use std::sync::Arc;
 
 /// Role of a thread known to the telemetry system.
-#[cfg(feature = "cpu-profiling")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ThreadRole {
     /// A tokio worker thread with the given index.
@@ -237,6 +236,35 @@ pub enum TelemetryEvent {
         /// Named field values in schema order.
         fields: Vec<(String, FieldValue)>,
     },
+    /// A sampled memory allocation event.
+    Alloc {
+        /// Wall-clock timestamp in nanoseconds (monotonic).
+        #[serde(rename = "timestamp_ns")]
+        timestamp_nanos: u64,
+        /// OS thread ID of the allocating thread.
+        tid: u32,
+        /// Allocation size in bytes.
+        size: u64,
+        /// Returned pointer address.
+        addr: u64,
+        /// Raw instruction pointer addresses (leaf first).
+        callchain: Vec<u64>,
+    },
+    /// A deallocation paired with a previously-sampled allocation.
+    Free {
+        /// Wall-clock timestamp in nanoseconds (monotonic) of the free.
+        #[serde(rename = "timestamp_ns")]
+        timestamp_nanos: u64,
+        /// OS thread ID of the freeing thread.
+        tid: u32,
+        /// Pointer that was freed.
+        addr: u64,
+        /// Size of the allocation being freed (denormalized).
+        size: u64,
+        /// Monotonic-ns timestamp of the original allocation.
+        #[serde(rename = "alloc_timestamp_ns")]
+        alloc_timestamp_nanos: u64,
+    },
 }
 
 impl TelemetryEvent {
@@ -262,6 +290,12 @@ impl TelemetryEvent {
                 timestamp_nanos, ..
             }
             | TelemetryEvent::TaskDump {
+                timestamp_nanos, ..
+            }
+            | TelemetryEvent::Alloc {
+                timestamp_nanos, ..
+            }
+            | TelemetryEvent::Free {
                 timestamp_nanos, ..
             }
             | TelemetryEvent::WakeEvent {
@@ -298,6 +332,8 @@ impl TelemetryEvent {
             | TelemetryEvent::TaskSpawn { .. }
             | TelemetryEvent::TaskTerminate { .. }
             | TelemetryEvent::TaskDump { .. }
+            | TelemetryEvent::Alloc { .. }
+            | TelemetryEvent::Free { .. }
             | TelemetryEvent::ThreadNameDef { .. }
             | TelemetryEvent::WakeEvent { .. }
             | TelemetryEvent::SegmentMetadata { .. }
