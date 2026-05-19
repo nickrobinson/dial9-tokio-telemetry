@@ -29,7 +29,7 @@ dial9-macro = { version = "0.3.6", path = "dial9-macro" }
 assert2 = "0.4"
 
 [patch.crates-io]
-libc = { path = "../libc" }
+libc = { git = "https://github.com/nickrobinson/libc", branch = "libc-0.2-android-timers" }
 
 [profile.release]
 debug = 1
