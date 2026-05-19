@@ -241,14 +241,15 @@ extern "C" fn sigprof_handler(
 ///   uc_stack:      24 bytes (offset 16)  [ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8)]
 ///   uc_sigmask:    8 bytes (offset 40)
 ///   __padding:     120 bytes (offset 48)  [128 - sizeof(sigset_t)]
-///   uc_mcontext:   (offset 168)
+///   __align_pad:   8 bytes (offset 168) [mcontext_t has align(16); 168%16=8]
+///   uc_mcontext:   (offset 176)
 ///     fault_address: 8 bytes
 ///     regs[31]:      248 bytes
 ///     sp:            8 bytes
-///     pc:            8 bytes  (offset 168 + 8 + 248 + 8 = 432)
+///     pc:            8 bytes  (offset 176 + 264 = 440)
 #[cfg(all(target_os = "android", target_arch = "aarch64"))]
 unsafe fn android_ucontext_pc(ucontext: *mut libc::c_void) -> u64 {
-    const PC_OFFSET: usize = 432; // 168 (mcontext) + 264 (fault_addr + regs[31] + sp)
+    const PC_OFFSET: usize = 440; // 176 (mcontext, 16-byte aligned) + 264 (fault_addr + regs[31] + sp)
     let base = ucontext as *const u8;
     unsafe { core::ptr::read_unaligned(base.add(PC_OFFSET) as *const u64) }
 }
