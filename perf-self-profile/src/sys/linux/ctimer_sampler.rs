@@ -203,10 +203,15 @@ extern "C" fn sigprof_handler(
         // the app's handler. Record only the interrupted PC to
         // avoid crashing; stacks are single-frame but still useful
         // for identifying hot functions.
+        //
+        // We also can't use `libc::ucontext_t` on Android because the
+        // libc crate's struct is missing the 120-byte `__padding` between
+        // `uc_sigmask` and `uc_mcontext` (Bionic pads sigmask to 128 bytes,
+        // but the libc crate's sigset_t is only 8 bytes). Read the PC
+        // directly at the correct offset.
         #[cfg(target_os = "android")]
         {
-            let uc = ucontext as *mut libc::ucontext_t;
-            let pc = (*uc).uc_mcontext.pc;
+            let pc = android_ucontext_pc(ucontext);
             let frames = slot.frames_mut();
             if !frames.is_empty() {
                 frames[0] = pc;
@@ -223,6 +228,30 @@ extern "C" fn sigprof_handler(
     }
 }
 
+/// Read the PC register from a ucontext on Android aarch64.
+///
+/// The `libc` crate's `ucontext_t` for Android is missing the 120-byte
+/// `__padding` field that Bionic inserts between `uc_sigmask` (8 bytes)
+/// and `uc_mcontext` to pad the sigmask area to 128 bytes. This makes
+/// `(*uc).uc_mcontext.pc` read from the wrong offset.
+///
+/// Bionic aarch64 layout:
+///   uc_flags:      8 bytes (offset 0)
+///   uc_link:       8 bytes (offset 8)
+///   uc_stack:      24 bytes (offset 16)  [ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8)]
+///   uc_sigmask:    8 bytes (offset 40)
+///   __padding:     120 bytes (offset 48)  [128 - sizeof(sigset_t)]
+///   uc_mcontext:   (offset 168)
+///     fault_address: 8 bytes
+///     regs[31]:      248 bytes
+///     sp:            8 bytes
+///     pc:            8 bytes  (offset 168 + 8 + 248 + 8 = 432)
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+unsafe fn android_ucontext_pc(ucontext: *mut libc::c_void) -> u64 {
+    const PC_OFFSET: usize = 432; // 168 (mcontext) + 264 (fault_addr + regs[31] + sp)
+    let base = ucontext as *const u8;
+    unsafe { core::ptr::read_unaligned(base.add(PC_OFFSET) as *const u64) }
+}
 
 #[cfg(test)]
 mod tests {
