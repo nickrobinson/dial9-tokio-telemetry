@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use crate::sys::linux::gettid;
 
+use libc::{timer_create, timer_delete, timer_settime};
+
 static INTERVAL_NS: AtomicI64 = AtomicI64::new(0);
 /// Whether sampling is currently enabled. Toggled by `disable`/`enable`.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -145,7 +147,7 @@ pub fn register_thread() -> Result<(), io::Error> {
 
     let mut timerid: libc::timer_t = ptr::null_mut();
     // SAFETY: `sev` and `timerid` are stack locals, libc may read/write them for this syscall only.
-    if unsafe { libc::timer_create(libc::CLOCK_THREAD_CPUTIME_ID, &mut sev, &mut timerid) } != 0 {
+    if unsafe { timer_create(libc::CLOCK_THREAD_CPUTIME_ID, &mut sev, &mut timerid) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -164,11 +166,11 @@ pub fn register_thread() -> Result<(), io::Error> {
 
     // SAFETY: `timerid` is from successful `timer_create`, `spec` is a stack-local reference,
     // `old_value` is null (allowed).
-    if unsafe { libc::timer_settime(timerid, 0, &spec, ptr::null_mut()) } != 0 {
+    if unsafe { timer_settime(timerid, 0, &spec, ptr::null_mut()) } != 0 {
         let err = io::Error::last_os_error();
         // Best-effort cleanup on failure.
         // SAFETY: same `timerid`, valid to delete after a failed `timer_settime`.
-        if unsafe { libc::timer_delete(timerid) } != 0 {
+        if unsafe { timer_delete(timerid) } != 0 {
             let cleanup_err = io::Error::last_os_error();
             tracing::warn!(
                 "ctimer: timer_delete after timer_settime failure failed: {cleanup_err}"
@@ -191,12 +193,12 @@ pub fn unregister_thread() {
             // Best-effort disarm before delete.
             // SAFETY: `t` is a live `timer_t` from this thread's registration, `zero` is stack-local,
             // `old_value` is null (allowed).
-            if unsafe { libc::timer_settime(t, 0, &zero, ptr::null_mut()) } != 0 {
+            if unsafe { timer_settime(t, 0, &zero, ptr::null_mut()) } != 0 {
                 let err = io::Error::last_os_error();
                 tracing::warn!("ctimer: timer_settime(disarm) failed in unregister_thread: {err}");
             }
             // SAFETY: `t` is still valid until `timer_delete` succeeds.
-            if unsafe { libc::timer_delete(t) } != 0 {
+            if unsafe { timer_delete(t) } != 0 {
                 let err = io::Error::last_os_error();
                 tracing::warn!("ctimer: timer_delete failed in unregister_thread: {err}");
             }
