@@ -49,7 +49,7 @@ impl PerfSampler {
             match config.sampling {
                 SamplingMode::FrequencyHz(_) => {
                     tracing::info!("DIAL9_FORCE_CTIMER set, using ctimer-based CPU profiling");
-                    return Self::with_ctimer_process_wide(&config);
+                    return Self::ctimer_fallback(&config);
                 }
                 SamplingMode::Period(_) => {
                     tracing::warn!(
@@ -75,7 +75,7 @@ impl PerfSampler {
                     "perf_event_open failed ({e}), falling back to ctimer-based \
                      CPU profiling (userspace frame-pointer unwinding)"
                 );
-                Self::with_ctimer_process_wide(&config)
+                Self::ctimer_fallback(&config)
             }
             Err(e) => Err(e),
         }
@@ -125,6 +125,24 @@ impl PerfSampler {
                 )),
             },
             Err(e) => Err(e),
+        }
+    }
+
+    /// Create ctimer sampler with the right registration strategy.
+    ///
+    /// On Linux, registers the calling thread (process-wide mode).
+    /// On Android, does NOT register the calling thread — the caller is
+    /// typically the main JVM thread whose ART interpreter frames lack
+    /// standard frame pointers, causing the unwinder to crash. Worker
+    /// threads self-register via `register_current_thread()`.
+    fn ctimer_fallback(config: &SamplerConfig) -> io::Result<Self> {
+        #[cfg(target_os = "android")]
+        {
+            Self::with_ctimer(config)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::with_ctimer_process_wide(config)
         }
     }
 
