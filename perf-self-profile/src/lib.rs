@@ -54,9 +54,9 @@ pub use sys::PerfSampler;
 pub use sys::resolve_symbol;
 
 // ctimer fallback status and thread registration
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use sys::is_ctimer_active;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn is_ctimer_active() -> bool {
     false
 }
@@ -65,7 +65,7 @@ pub fn is_ctimer_active() -> bool {
 ///
 /// No-op unless ctimer fallback is active (perf uses `inherit` instead).
 pub fn register_current_thread() -> Result<(), std::io::Error> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if is_ctimer_active() {
         return crate::sys::fp_profiler::ctimer::register_thread();
     }
@@ -76,18 +76,18 @@ pub fn register_current_thread() -> Result<(), std::io::Error> {
 ///
 /// No-op unless ctimer fallback is active.
 pub fn unregister_current_thread() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if is_ctimer_active() {
         crate::sys::fp_profiler::ctimer::unregister_thread();
     }
 }
 
 // blazesym-dependent APIs
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use sys::{resolve_symbol_with_maps, resolve_symbols_with_maps};
 
 /// Internal module exposed only for benchmarks. Not part of the public API.
-#[cfg(all(target_os = "linux", feature = "__internal-bench"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "__internal-bench"))]
 #[doc(hidden)]
 pub mod __bench_internals {
     pub use crate::sys::fp_profiler::install_handler;

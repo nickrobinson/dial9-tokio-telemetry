@@ -13,6 +13,8 @@ use super::fp_profiler::{
     unwind::{self, MAX_FRAMES},
 };
 use super::gettid;
+
+use libc::{timer_getoverrun, timer_settime};
 use super::sampler::SamplerBackend;
 
 use crate::sampler::{Sample, SamplerConfig};
@@ -151,7 +153,7 @@ extern "C" fn sigprof_handler(
             // is valid and disarms without deleting.
             unsafe {
                 let zero: libc::itimerspec = mem::zeroed();
-                libc::timer_settime(t, 0, &zero, ptr::null_mut());
+                timer_settime(t, 0, &zero, ptr::null_mut());
             }
         }
         return;
@@ -201,10 +203,6 @@ extern "C" fn sigprof_handler(
     }
 }
 
-// timer_getoverrun is POSIX async-signal-safe.
-unsafe extern "C" {
-    fn timer_getoverrun(timerid: libc::timer_t) -> libc::c_int;
-}
 
 #[cfg(test)]
 mod tests {
