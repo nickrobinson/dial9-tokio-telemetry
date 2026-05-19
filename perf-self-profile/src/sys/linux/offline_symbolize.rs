@@ -9,6 +9,24 @@ use super::USER_ADDR_LIMIT;
 use crate::MapsEntry;
 use crate::offline_symbolize::SymbolTableEntry;
 
+/// Strip TBI/MTE tag bits from an aarch64 address.
+///
+/// On Android with MTE or TBI, pointers carry a tag in the top byte
+/// (e.g. `0xb400006fd9572000`). The hardware ignores this byte for
+/// address translation, but the raw value from registers retains it.
+/// Strip before comparing against `USER_ADDR_LIMIT` or matching maps.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn strip_tbi(addr: u64) -> u64 {
+    addr & 0x00FF_FFFF_FFFF_FFFF
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn strip_tbi(addr: u64) -> u64 {
+    addr
+}
+
 pub(crate) fn write_symbol_data(
     decoder: Decoder<'_>,
     addresses: &HashSet<u64>,
@@ -20,23 +38,46 @@ pub(crate) fn write_symbol_data(
     // We need to basically have a background symbolization thread.
     let symbolizer = Symbolizer::new();
 
+    if maps.is_empty() {
+        tracing::warn!(
+            "symbolize: /proc/self/maps returned no executable mappings, \
+             skipping symbolization"
+        );
+    }
+
     // Partition addresses into kernel vs userspace, group userspace by mapping.
     let mut kernel_addrs: Vec<u64> = Vec::new();
     // (mapping_index, file_offset, original_addr)
     let mut user_groups: HashMap<usize, Vec<(u64, u64)>> = HashMap::new();
+    let mut unmatched: usize = 0;
 
     for &addr in addresses {
-        if addr >= USER_ADDR_LIMIT {
+        let stripped = strip_tbi(addr);
+        if stripped >= USER_ADDR_LIMIT {
             kernel_addrs.push(addr);
         } else {
+            let mut matched = false;
             for (i, entry) in maps.iter().enumerate() {
-                if addr >= entry.start && addr < entry.end {
-                    let offset = addr - entry.start + entry.file_offset;
+                if stripped >= entry.start && stripped < entry.end {
+                    let offset = stripped - entry.start + entry.file_offset;
                     user_groups.entry(i).or_default().push((offset, addr));
+                    matched = true;
                     break;
                 }
             }
+            if !matched {
+                unmatched += 1;
+            }
         }
+    }
+
+    if unmatched > 0 {
+        tracing::debug!(
+            unmatched,
+            total = addresses.len(),
+            maps_entries = maps.len(),
+            "symbolize: userspace addresses did not match any mapping"
+        );
     }
 
     // Batch-resolve kernel addresses.
@@ -116,6 +157,20 @@ fn write_symbolized_batch(
 ) -> io::Result<()> {
     for (symbolized, &addr) in results.iter().zip(addrs) {
         let Some(sym) = symbolized.as_sym() else {
+            // blazesym couldn't resolve this address — emit a placeholder
+            // so the viewer shows something instead of a raw hex address.
+            let name = format!("[unknown] {:#x}", strip_tbi(addr));
+            let symbol_name = encoder.intern_string(&name)?;
+            let source_file = encoder.intern_string("")?;
+            encoder.write(&SymbolTableEntry {
+                timestamp_ns: 0,
+                addr,
+                size: 0,
+                symbol_name,
+                inline_depth: 0,
+                source_file,
+                source_line: 0,
+            })?;
             continue;
         };
         let symbol_name = encoder.intern_string(&sym.name)?;
