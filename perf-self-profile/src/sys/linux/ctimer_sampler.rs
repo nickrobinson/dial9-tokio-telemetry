@@ -195,9 +195,29 @@ extern "C" fn sigprof_handler(
 
         slot.write(pid, tid, time, cpu, period);
 
-        // Unwind into the slot's frame buffer
-        let result = unwind::unwind_from_ucontext(ucontext, slot.frames_mut());
-        slot.set_num_frames(result.frames_written as u32);
+        // Unwind into the slot's frame buffer.
+        //
+        // On Android, the safe_load SIGSEGV handler (which makes
+        // frame-pointer unwinding fault-tolerant) doesn't work
+        // because Android's libsigchain intercepts SIGSEGV before
+        // the app's handler. Record only the interrupted PC to
+        // avoid crashing; stacks are single-frame but still useful
+        // for identifying hot functions.
+        #[cfg(target_os = "android")]
+        {
+            let uc = ucontext as *mut libc::ucontext_t;
+            let pc = (*uc).uc_mcontext.pc;
+            let frames = slot.frames_mut();
+            if !frames.is_empty() {
+                frames[0] = pc;
+            }
+            slot.set_num_frames(1);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let result = unwind::unwind_from_ucontext(ucontext, slot.frames_mut());
+            slot.set_num_frames(result.frames_written as u32);
+        }
 
         slot.commit();
     }
