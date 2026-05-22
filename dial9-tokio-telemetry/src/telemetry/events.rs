@@ -383,28 +383,28 @@ pub(crate) fn current_tid() -> u32 {
 
 /// Read the calling thread's CPU time via `CLOCK_THREAD_CPUTIME_ID`.
 /// This is a vDSO call on Linux (~20-40ns), no actual syscall.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn thread_cpu_time_nanos() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: `ts` is a valid, initialized timespec on the stack.
-    // CLOCK_THREAD_CPUTIME_ID is always available on Linux and always succeeds.
+    // CLOCK_THREAD_CPUTIME_ID is always available on Linux/Android and always succeeds.
     unsafe {
         libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn thread_cpu_time_nanos() -> u64 {
     0
 }
 
 /// Read `CLOCK_MONOTONIC` in nanoseconds. Used as the single time base for
 /// all trace timestamps (poll events, CPU samples, sched events).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn clock_monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -418,7 +418,7 @@ pub fn clock_monotonic_ns() -> u64 {
 
 /// `CLOCK_MONOTONIC` in nanoseconds. Non-Linux fallback: elapsed time
 /// since the first call on this process via `Instant`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn clock_monotonic_ns() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -427,7 +427,7 @@ pub fn clock_monotonic_ns() -> u64 {
 }
 
 /// `CLOCK_REALTIME` in nanoseconds since the Unix epoch.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn clock_realtime_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -439,7 +439,7 @@ pub(crate) fn clock_realtime_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn clock_realtime_ns() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

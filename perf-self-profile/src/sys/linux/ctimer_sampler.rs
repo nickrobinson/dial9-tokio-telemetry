@@ -13,6 +13,8 @@ use super::fp_profiler::{
     unwind::{self, MAX_FRAMES},
 };
 use super::gettid;
+
+use libc::{timer_getoverrun, timer_settime};
 use super::sampler::SamplerBackend;
 
 use crate::sampler::{Sample, SamplerConfig};
@@ -151,7 +153,7 @@ extern "C" fn sigprof_handler(
             // is valid and disarms without deleting.
             unsafe {
                 let zero: libc::itimerspec = mem::zeroed();
-                libc::timer_settime(t, 0, &zero, ptr::null_mut());
+                timer_settime(t, 0, &zero, ptr::null_mut());
             }
         }
         return;
@@ -193,17 +195,63 @@ extern "C" fn sigprof_handler(
 
         slot.write(pid, tid, time, cpu, period);
 
-        // Unwind into the slot's frame buffer
-        let result = unwind::unwind_from_ucontext(ucontext, slot.frames_mut());
-        slot.set_num_frames(result.frames_written as u32);
+        // Unwind into the slot's frame buffer.
+        //
+        // On Android, the safe_load SIGSEGV handler (which makes
+        // frame-pointer unwinding fault-tolerant) doesn't work
+        // because Android's libsigchain intercepts SIGSEGV before
+        // the app's handler. Record only the interrupted PC to
+        // avoid crashing; stacks are single-frame but still useful
+        // for identifying hot functions.
+        //
+        // We also can't use `libc::ucontext_t` on Android because the
+        // libc crate's struct is missing the 120-byte `__padding` between
+        // `uc_sigmask` and `uc_mcontext` (Bionic pads sigmask to 128 bytes,
+        // but the libc crate's sigset_t is only 8 bytes). Read the PC
+        // directly at the correct offset.
+        #[cfg(target_os = "android")]
+        {
+            let pc = android_ucontext_pc(ucontext);
+            let frames = slot.frames_mut();
+            if !frames.is_empty() {
+                frames[0] = pc;
+            }
+            slot.set_num_frames(1);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let result = unwind::unwind_from_ucontext(ucontext, slot.frames_mut());
+            slot.set_num_frames(result.frames_written as u32);
+        }
 
         slot.commit();
     }
 }
 
-// timer_getoverrun is POSIX async-signal-safe.
-unsafe extern "C" {
-    fn timer_getoverrun(timerid: libc::timer_t) -> libc::c_int;
+/// Read the PC register from a ucontext on Android aarch64.
+///
+/// The `libc` crate's `ucontext_t` for Android is missing the 120-byte
+/// `__padding` field that Bionic inserts between `uc_sigmask` (8 bytes)
+/// and `uc_mcontext` to pad the sigmask area to 128 bytes. This makes
+/// `(*uc).uc_mcontext.pc` read from the wrong offset.
+///
+/// Bionic aarch64 layout:
+///   uc_flags:      8 bytes (offset 0)
+///   uc_link:       8 bytes (offset 8)
+///   uc_stack:      24 bytes (offset 16)  [ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8)]
+///   uc_sigmask:    8 bytes (offset 40)
+///   __padding:     120 bytes (offset 48)  [128 - sizeof(sigset_t)]
+///   __align_pad:   8 bytes (offset 168) [mcontext_t has align(16); 168%16=8]
+///   uc_mcontext:   (offset 176)
+///     fault_address: 8 bytes
+///     regs[31]:      248 bytes
+///     sp:            8 bytes
+///     pc:            8 bytes  (offset 176 + 264 = 440)
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+unsafe fn android_ucontext_pc(ucontext: *mut libc::c_void) -> u64 {
+    const PC_OFFSET: usize = 440; // 176 (mcontext, 16-byte aligned) + 264 (fault_addr + regs[31] + sp)
+    let base = ucontext as *const u8;
+    unsafe { core::ptr::read_unaligned(base.add(PC_OFFSET) as *const u64) }
 }
 
 #[cfg(test)]
