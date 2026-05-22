@@ -9,9 +9,9 @@
 use crate::primitives::sync::atomic::{AtomicU64, Ordering};
 use crate::primitives::sync::{Arc, Mutex, Weak};
 use crate::telemetry::collector::CentralCollector;
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 use crate::telemetry::events::CpuSampleData;
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 use crate::telemetry::format::CpuSampleEvent;
 use dial9_trace_format::encoder::{Encoder, FxHashMap};
 use dial9_trace_format::{InternedStackFrames, InternedString};
@@ -167,7 +167,7 @@ impl<T: dial9_trace_format::TraceEvent + 'static> Encodable for T {
     }
 }
 
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 impl Encodable for CpuSampleData {
     fn encode(&self, enc: &mut ThreadLocalEncoder<'_>) {
         let thread_name = self
@@ -542,7 +542,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     mod cpu_tests {
         use super::ThreadLocalBuffer;
 

@@ -1,6 +1,6 @@
 use crate::primitives::sync::Arc;
 use crate::primitives::sync::atomic::Ordering;
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 use crate::rate_limit::rate_limited;
 use crate::telemetry::writer::{RotatingWriter, TraceWriter};
 use std::path::PathBuf;
@@ -57,7 +57,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset> {
     pub(super) runtime_name: Option<String>,
     #[cfg(feature = "cpu-profiling")]
     pub(super) cpu_profiling_config: Option<crate::telemetry::cpu_profile::CpuProfilingConfig>,
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
     pub(super) pipeline: PipelineConfig,
     /// Static segment metadata to inject into every rotated segment's
@@ -149,7 +149,7 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
     }
 
     /// Enable per-worker scheduler event capture (Linux only).
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     pub fn with_sched_events(
         mut self,
         config: crate::telemetry::cpu_profile::SchedEventConfig,
@@ -204,7 +204,7 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
             runtime_name: self.runtime_name,
             #[cfg(feature = "cpu-profiling")]
             cpu_profiling_config: self.cpu_profiling_config,
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             sched_event_config: self.sched_event_config,
             pipeline: self.pipeline,
             segment_metadata: self.segment_metadata,
@@ -417,7 +417,7 @@ impl<M> TracedRuntimeBuilder<HasTracePath, M> {
         }
 
         let processors = assemble_processors(
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             self.cpu_profiling_config.is_some(),
             self.pipeline,
         );
@@ -431,7 +431,7 @@ impl<M> TracedRuntimeBuilder<HasTracePath, M> {
             .processors(processors)
             .segment_metadata(self.segment_metadata);
 
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         let core_builder = core_builder
             .maybe_cpu_profiling(self.cpu_profiling_config)
             .maybe_sched_events(self.sched_event_config);
@@ -471,10 +471,10 @@ impl<M> TracedRuntimeBuilder<HasTracePath, M> {
 /// | S3       | `[Symbolize, Gzip, S3]`        | `[Gzip, S3]`      |
 /// | Custom   | `[...user]`                    | `[...user]`       |
 pub(super) fn assemble_processors(
-    #[cfg(feature = "cpu-profiling")] cpu_profiling_enabled: bool,
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))] cpu_profiling_enabled: bool,
     pipeline: PipelineConfig,
 ) -> Vec<Box<dyn crate::background_task::SegmentProcessor>> {
-    #[cfg(not(feature = "cpu-profiling"))]
+    #[cfg(not(all(feature = "cpu-profiling", target_arch = "aarch64")))]
     let cpu_profiling_enabled = false;
 
     if matches!(pipeline, PipelineConfig::Unset) && !cpu_profiling_enabled {
@@ -484,7 +484,7 @@ pub(super) fn assemble_processors(
     let mut processors: Vec<Box<dyn crate::background_task::SegmentProcessor>> = Vec::new();
     match pipeline {
         PipelineConfig::Unset => {
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             if cpu_profiling_enabled {
                 processors.push(Box::new(crate::background_task::SymbolizeProcessor));
             }
@@ -493,7 +493,7 @@ pub(super) fn assemble_processors(
         }
         #[cfg(feature = "worker-s3")]
         PipelineConfig::S3(uploader) => {
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             if cpu_profiling_enabled {
                 processors.push(Box::new(crate::background_task::SymbolizeProcessor));
             }
@@ -564,10 +564,10 @@ impl TelemetryCore {
         /// crate feature to actually record events.
         task_dump_config: Option<crate::telemetry::task_dump_config::TaskDumpConfig>,
         /// Enable CPU profiling (Linux only).
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         cpu_profiling: Option<crate::telemetry::cpu_profile::CpuProfilingConfig>,
         /// Enable scheduler event capture (Linux only).
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         sched_events: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
         /// How often the background worker polls for sealed segments.
         worker_poll_interval: Option<Duration>,
@@ -613,7 +613,7 @@ impl TelemetryCore {
         };
 
         let processors = assemble_processors(
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             cpu_profiling.is_some(),
             pipeline,
         );
@@ -625,7 +625,7 @@ impl TelemetryCore {
             event_writer.update_segment_metadata(segment_metadata);
         }
 
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         {
             if let Some(ref config) = cpu_profiling {
                 match crate::telemetry::cpu_profile::CpuProfiler::start(config.clone()) {
@@ -664,10 +664,10 @@ impl TelemetryCore {
                     let _ = libc::nice(10);
                 }
 
-                #[cfg(feature = "cpu-profiling")]
+                #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
                 let _ = dial9_perf_self_profile::register_current_thread();
                 run_flush_loop(control_rx, &shared, &flush_metrics_sink, event_writer);
-                #[cfg(feature = "cpu-profiling")]
+                #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
                 dial9_perf_self_profile::unregister_current_thread();
             })
         };
@@ -700,10 +700,10 @@ impl TelemetryCore {
         if let Some(config) = worker_config {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             let wt = crate::primitives::thread::spawn_named("dial9-worker", move || {
-                #[cfg(feature = "cpu-profiling")]
+                #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
                 let _ = dial9_perf_self_profile::register_current_thread();
                 crate::background_task::run_background_task(config, shutdown_rx);
-                #[cfg(feature = "cpu-profiling")]
+                #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
                 dial9_perf_self_profile::unregister_current_thread();
             });
             worker = Some(WorkerHandle {
@@ -786,7 +786,7 @@ impl TracedRuntime {
             runtime_name: None,
             #[cfg(feature = "cpu-profiling")]
             cpu_profiling_config: None,
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             sched_event_config: None,
             pipeline: PipelineConfig::Unset,
             segment_metadata: Vec::new(),

@@ -1,7 +1,7 @@
 use crate::telemetry::{format::WorkerId, task_metadata::TaskId};
 use dial9_trace_format::{FieldValue, InternedString};
 use serde::Serialize;
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 use std::sync::Arc;
 
 /// Role of a thread known to the telemetry system.
@@ -32,11 +32,11 @@ impl CpuSampleSource {
     }
 }
 
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ThreadName(Arc<str>);
 
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 impl ThreadName {
     pub(crate) fn new(name: String) -> Self {
         Self(name.into())
@@ -353,7 +353,7 @@ impl TelemetryEvent {
 /// be written directly into the thread-local trace buffer without an
 /// intermediate enum. Interning of `thread_name` and `callchain` happens in
 /// the `Encodable::encode` impl.
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 #[derive(Debug, Clone)]
 pub(crate) struct CpuSampleData {
     pub timestamp_nanos: u64,

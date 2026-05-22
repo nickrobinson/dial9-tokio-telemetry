@@ -237,7 +237,7 @@ fn stderr_metrics_sink() -> metrique_writer::BoxEntrySink {
     )
 }
 
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 fn configure_runtime_common(
     mut r: TracedRuntimeBuilder<HasTracePath, PipelineUnset>,
     metrics_sink: metrique_writer::BoxEntrySink,
@@ -258,7 +258,7 @@ fn configure_runtime_common(
     r
 }
 
-#[cfg(not(feature = "cpu-profiling"))]
+#[cfg(not(all(feature = "cpu-profiling", target_arch = "aarch64")))]
 fn configure_runtime_common(
     r: TracedRuntimeBuilder<HasTracePath, PipelineUnset>,
     metrics_sink: metrique_writer::BoxEntrySink,
@@ -291,7 +291,7 @@ fn configure_dial9(opts: &Dial9Opts) -> Dial9Config {
         warn_if_feature_missing(opts);
     }
 
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     let (cpu_enabled, sched_enabled, cpu_hz) = (
         opts.cpu_profile_enabled,
         opts.schedule_profile_enabled,
@@ -317,12 +317,12 @@ fn configure_dial9(opts: &Dial9Opts) -> Dial9Config {
         return cfg
             .with_runtime(move |r| {
                 let sink = stderr_metrics_sink();
-                #[cfg(feature = "cpu-profiling")]
+                #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
                 {
                     configure_runtime_common(r, sink, cpu_enabled, sched_enabled, cpu_hz)
                         .with_s3_uploader(s3)
                 }
-                #[cfg(not(feature = "cpu-profiling"))]
+                #[cfg(not(all(feature = "cpu-profiling", target_arch = "aarch64")))]
                 {
                     configure_runtime_common(r, sink).with_s3_uploader(s3)
                 }
@@ -332,11 +332,11 @@ fn configure_dial9(opts: &Dial9Opts) -> Dial9Config {
 
     cfg.with_runtime(move |r| {
         let sink = stderr_metrics_sink();
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         {
             configure_runtime_common(r, sink, cpu_enabled, sched_enabled, cpu_hz)
         }
-        #[cfg(not(feature = "cpu-profiling"))]
+        #[cfg(not(all(feature = "cpu-profiling", target_arch = "aarch64")))]
         {
             configure_runtime_common(r, sink)
         }
@@ -347,7 +347,7 @@ fn configure_dial9(opts: &Dial9Opts) -> Dial9Config {
 /// Complain at startup when the operator asked for something a feature flag
 /// disables, so silent misconfiguration doesn't go unnoticed.
 fn warn_if_feature_missing(opts: &Dial9Opts) {
-    if cfg!(not(feature = "cpu-profiling"))
+    if cfg!(not(all(feature = "cpu-profiling", target_arch = "aarch64")))
         && (opts.cpu_profile_enabled || opts.schedule_profile_enabled)
     {
         eprintln!(
