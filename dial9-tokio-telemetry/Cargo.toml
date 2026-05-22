@@ -41,7 +41,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 bytes = "1"
-dial9-perf-self-profile = { workspace = true, optional = true }
 dial9-trace-format = { workspace = true, features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
@@ -64,6 +63,9 @@ metrique = { version = "0.1.23", features = ["local-format"] }
 metrique-timesource = "0.1"
 dial9-macro = { workspace = true }
 shuttle = { version = "0.9.1", optional = true }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+dial9-perf-self-profile = { workspace = true, optional = true }
 
 [features]
 analysis = []
