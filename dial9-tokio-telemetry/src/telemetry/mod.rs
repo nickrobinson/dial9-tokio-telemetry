@@ -14,6 +14,7 @@ pub(crate) mod collector;
 pub use collector::Batch;
 #[cfg(feature = "cpu-profiling")]
 pub mod cpu_profile;
+pub(crate) mod custom_events;
 pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod process_resource_usage;
@@ -24,7 +25,7 @@ pub(crate) mod writer;
 
 pub use crate::traced::TracedFuture;
 pub use buffer::{Encodable, ThreadLocalEncoder};
-
+pub use custom_events::{CustomEventsConfig, CustomEventsContext};
 pub use events::{CpuSampleSource, clock_monotonic_ns};
 pub use format::{
     AllocEvent, FreeEvent, PollEndEvent, PollStartEvent, ProcessResourceUsageEvent, TaskSpawnEvent,
