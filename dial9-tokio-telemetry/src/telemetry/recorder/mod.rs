@@ -1359,7 +1359,7 @@ mod tests {
     #[test]
     fn try_new_enabled_path_returns_value_and_exposes_guard() {
         let cfg = crate::Dial9Config::builder()
-            .base_path(dial9_config_tmp_base_path())
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .max_file_size(1024 * 1024)
             .max_total_size(4 * 1024 * 1024)
             .build()
@@ -1378,6 +1378,7 @@ mod tests {
     #[test]
     fn try_new_disabled_path_returns_value_no_guard() {
         let cfg = crate::Dial9Config::builder()
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .enabled(false)
             .build()
             .expect("disabled build should succeed");
@@ -1400,6 +1401,7 @@ mod tests {
         // tests assert that the inner `TelemetryRuntimeError` formats
         // through `Display` correctly.
         let cfg = crate::Dial9Config::builder()
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .enabled(false)
             .build()
             .expect("disabled build should succeed");
@@ -1489,6 +1491,7 @@ mod tests {
     #[test]
     fn disabled_dial9_config_yields_inert_guard() {
         let cfg = crate::Dial9Config::builder()
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .enabled(false)
             .build()
             .expect("disabled build should succeed");
