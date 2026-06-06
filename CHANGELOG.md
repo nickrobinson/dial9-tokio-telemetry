@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-alpha.2](https://github.com/nickrobinson/dial9-tokio-telemetry/compare/dial9-tokio-telemetry-v0.4.0-alpha.1...dial9-tokio-telemetry-v0.4.0-alpha.2) - 2026-06-06
+
+### Added
+
+- *(config)* [**breaking**] in-memory support for dial9 main macro ([#490](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/490))
+- [**breaking**] replace `TelemetryEvent` and Rust decode side with new serde-based approach ([#485](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/485))
+- add dial9-s3-analysis agent skill ([#491](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/491))
+
+### Fixed
+
+- merge CPU sample groups by full stack, not just leaf frame ([#484](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/484))
+
+### Other
+
+- Cache the symbolizer across segments ([#462](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/462)) ([#465](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/465))
+- Add dial9-html-report skill: agent-authored HTML trace reports ([#488](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/488))
+- Improve Wire ID Resolution ([#487](https://github.com/nickrobinson/dial9-tokio-telemetry/pull/487))
+
 ### Added
 
 - In-memory writer (`InMemoryWriter`): run the trace pipeline with no filesystem dependency, encoded segments are held in process memory and shipped by the existing processor pipeline ([#435](https://github.com/dial9-rs/dial9/pull/435))
