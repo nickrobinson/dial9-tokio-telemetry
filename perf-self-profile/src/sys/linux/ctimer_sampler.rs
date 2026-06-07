@@ -197,26 +197,32 @@ extern "C" fn sigprof_handler(
 
         // Unwind into the slot's frame buffer.
         //
-        // On Android, the safe_load SIGSEGV handler (which makes
-        // frame-pointer unwinding fault-tolerant) doesn't work
-        // because Android's libsigchain intercepts SIGSEGV before
-        // the app's handler. Record only the interrupted PC to
-        // avoid crashing; stacks are single-frame but still useful
-        // for identifying hot functions.
+        // On Android, the safe_load SIGSEGV recovery used by the
+        // frame-pointer unwinder only works if we registered with
+        // `libsigchain` (ART's signal-chaining library) via
+        // `AddSpecialSignalHandlerFn`. If that succeeded we can walk frame
+        // pointers safely; otherwise libsigchain owns SIGSEGV and a bad FP
+        // read would crash the process, so we degrade to a single-PC sample
+        // — still useful for identifying hot functions in the viewer.
         //
         // We also can't use `libc::ucontext_t` on Android because the
         // libc crate's struct is missing the 120-byte `__padding` between
         // `uc_sigmask` and `uc_mcontext` (Bionic pads sigmask to 128 bytes,
         // but the libc crate's sigset_t is only 8 bytes). Read the PC
-        // directly at the correct offset.
+        // directly at the correct offset for the fallback path.
         #[cfg(target_os = "android")]
         {
-            let pc = bionic_arm64::android_ucontext_pc(ucontext);
-            let frames = slot.frames_mut();
-            if !frames.is_empty() {
-                frames[0] = pc;
+            if crate::sys::fp_profiler::fp_unwind_supported() {
+                let result = unwind::unwind_from_ucontext(ucontext, slot.frames_mut());
+                slot.set_num_frames(result.frames_written as u32);
+            } else {
+                let pc = crate::sys::fp_profiler::bionic_arm64::android_ucontext_pc(ucontext);
+                let frames = slot.frames_mut();
+                if !frames.is_empty() {
+                    frames[0] = pc;
+                }
+                slot.set_num_frames(1);
             }
-            slot.set_num_frames(1);
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -226,124 +232,6 @@ extern "C" fn sigprof_handler(
 
         slot.commit();
     }
-}
-
-#[cfg(all(target_os = "android", target_arch = "aarch64"))]
-#[allow(nonstandard_style)]
-mod bionic_arm64 {
-    use ::core::ffi::*;
-
-    /// Read the PC register from a ucontext on Android aarch64.
-    ///
-    /// The `libc` crate's `ucontext_t` for Android is missing the 120-byte
-    /// `__padding` field that Bionic inserts between `uc_sigmask` (8 bytes)
-    /// and `uc_mcontext` to pad the sigmask area to 128 bytes. This makes
-    /// `(*uc).uc_mcontext.pc` read from the wrong offset.
-    pub unsafe fn android_ucontext_pc(ucontext: *mut c_void) -> u64 {
-        // We used to hard-code 440 here; let's justify both why we used to do that,
-        // and why the newer struct-def-based code is at least just as legitimate.
-        const {
-            assert! {
-                ::core::mem::offset_of!(
-                    struct_ucontext /* -> */ ,uc_mcontext.pc
-                )
-                ==
-                440
-            };
-        }
-        unsafe {
-            (*ucontext.cast::<struct_ucontext>()).uc_mcontext.pc
-        }
-    }
-
-    /// See <https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/kernel/uapi/asm-arm64/asm/ucontext.h>
-    ///
-    /// ```c
-    /// struct ucontext {
-    ///         unsigned long uc_flags;
-    ///     struct ucontext * uc_link;
-    ///               stack_t uc_stack;
-    ///              sigset_t uc_sigmask;
-    ///                  __u8 __linux_unused[1024 / 8 - sizeof(sigset_t)];
-    ///     struct sigcontext uc_mcontext;
-    /// };
-    /// ``````
-    #[repr(C)]
-    pub struct struct_ucontext {
-        pub uc_flags: c_ulong,
-        pub uc_link: *mut struct_ucontext,
-        pub uc_stack: stack_t,
-        pub uc_sigmask: reserved_sigset_t,
-        pub uc_mcontext: struct_sigcontext,
-    }
-
-    /// The proper way to encode this padding (as a matter of fact; C should have done the same…).
-    #[repr(C)]
-    pub union reserved_sigset_t {
-        pub actual: sigset_t,
-        pub reserved: [u8; 1024 / 8],
-    }
-
-    /// See <https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/kernel/uapi/asm-arm64/asm/ucontext.h>
-    ///
-    /// ```c
-    /// typedef struct sigaltstack {
-    ///           void  * ss_sp;
-    ///               int ss_flags;
-    ///   __kernel_size_t ss_size;
-    /// } stack_t;
-    /// ```
-    #[repr(C)]
-    pub struct stack_t {
-        pub ss_sp: *mut c_void,
-        pub ss_flags: c_int,
-        pub ss_size: kernel_size_t,
-    }
-
-    /// See <https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/kernel/uapi/asm-generic/posix_types.h#47>
-    pub type kernel_size_t = c_ulong;
-
-    /// <https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/kernel/uapi/asm-generic/signal.h#58>
-    ///
-    /// ```c
-    /// #define _NSIG 64
-    /// #define _NSIG_BPW __BITS_PER_LONG   // 64 on aarch64
-    /// #define _NSIG_WORDS (_NSIG / _NSIG_BPW)  // 1
-    ///
-    /// typedef struct {
-    ///     unsigned long sig[_NSIG_WORDS];
-    /// } sigset_t;
-    /// ```
-    #[derive(Clone, Copy)]
-    #[repr(C)]
-    pub struct sigset_t {
-        pub sig: [c_ulong; 1],
-    }
-
-    /// <https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/kernel/uapi/asm-arm64/asm/sigcontext.h#11>
-    ///
-    /// ```c
-    /// struct sigcontext {
-    ///   __u64 fault_address;
-    ///   __u64 regs[31];
-    ///   __u64 sp;
-    ///   __u64 pc;
-    ///   __u64 pstate;
-    ///    __u8 __reserved[4096] __attribute__((__aligned__(16)));
-    /// };
-    /// ```
-    #[repr(C)]
-    pub struct struct_sigcontext {
-        pub fault_address: u64,
-        pub regs: [u64; 31],
-        pub sp: u64,
-        pub pc: u64,
-        pub pstate: u64,
-        pub __reserved: Align16<[u8; 4096]>,
-    }
-
-    #[repr(C, align(16))]
-    pub struct Align16<T>(pub T);
 }
 
 #[cfg(test)]
