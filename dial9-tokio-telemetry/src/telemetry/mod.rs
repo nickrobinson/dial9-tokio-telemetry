@@ -12,8 +12,15 @@ pub use collector::Batch;
 pub mod cpu_profile;
 #[cfg(all(feature = "cpu-profiling", not(target_arch = "aarch64")))]
 pub mod cpu_profile {
+    /// Dummy no-op mock for when targeting a `cpu-profiling`-incompatible platform.
     #[derive(Default, Debug)]
     pub struct CpuProfilingConfig {
+        _private: ()
+    }
+
+    /// Dummy no-op mock for when targeting a `cpu-profiling`-incompatible platform.
+    #[derive(Default, Debug)]
+    pub struct SchedEventConfig {
         _private: ()
     }
 }
