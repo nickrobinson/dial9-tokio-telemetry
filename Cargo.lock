@@ -5247,4 +5247,4 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 [[patch.unused]]
 name = "dial9-tokio-telemetry"
 version = "0.3.10"
-source = "git+https://github.com/getditto/dial9-tokio-telemetry.git?branch=vp-obs%2Fdhm-tweaks#56c2ff75cb56b3fb232a22e8efc0a0bd231f3b40"
+source = "git+https://github.com/getditto/dial9-tokio-telemetry.git?branch=vp-obs%2Fandroid-sigchain-prototype#8ce36f836b6b14bce8dd70ff23c815e5a971f03a"

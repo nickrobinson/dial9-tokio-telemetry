@@ -57,7 +57,7 @@ pub struct TracedRuntimeBuilder<P = NoTracePath, M = PipelineUnset> {
     pub(super) runtime_name: Option<String>,
     #[cfg(feature = "cpu-profiling")]
     pub(super) cpu_profiling_config: Option<crate::telemetry::cpu_profile::CpuProfilingConfig>,
-    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
+    #[cfg(feature = "cpu-profiling")]
     pub(super) sched_event_config: Option<crate::telemetry::cpu_profile::SchedEventConfig>,
     pub(super) pipeline: PipelineConfig,
     /// Static segment metadata to inject into every rotated segment's
@@ -149,7 +149,7 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
     }
 
     /// Enable per-worker scheduler event capture (Linux only).
-    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
+    #[cfg(feature = "cpu-profiling")]
     pub fn with_sched_events(
         mut self,
         config: crate::telemetry::cpu_profile::SchedEventConfig,
@@ -204,7 +204,7 @@ impl<P, M> TracedRuntimeBuilder<P, M> {
             runtime_name: self.runtime_name,
             #[cfg(feature = "cpu-profiling")]
             cpu_profiling_config: self.cpu_profiling_config,
-            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
+            #[cfg(feature = "cpu-profiling")]
             sched_event_config: self.sched_event_config,
             pipeline: self.pipeline,
             segment_metadata: self.segment_metadata,
@@ -786,7 +786,7 @@ impl TracedRuntime {
             runtime_name: None,
             #[cfg(feature = "cpu-profiling")]
             cpu_profiling_config: None,
-            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
+            #[cfg(feature = "cpu-profiling")]
             sched_event_config: None,
             pipeline: PipelineConfig::Unset,
             segment_metadata: Vec::new(),
