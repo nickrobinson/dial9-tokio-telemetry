@@ -247,6 +247,9 @@ const ENV_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: &str = "DIAL9_TASK_DUMP_IDLE_THRESH
 const ENV_DIAL9_PROCESS_RESOURCE_USAGE_ENABLED: &str = "DIAL9_PROCESS_RESOURCE_USAGE_ENABLED";
 const ENV_DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS: &str =
     "DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS";
+const ENV_DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED: &str = "DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED";
+const ENV_DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS: &str =
+    "DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS";
 
 const DEFAULT_ENABLED: bool = false;
 const DEFAULT_TRACE_DIR: &str = "/tmp/dial9-traces";
@@ -297,6 +300,8 @@ struct ParsedEnvConfig {
     task_dump_idle_threshold: Option<Duration>,
     process_resource_usage_enabled: Option<bool>,
     process_resource_usage_sample_interval: Option<Duration>,
+    socket_accept_queues_enabled: Option<bool>,
+    socket_accept_queues_sample_interval: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -353,6 +358,12 @@ struct ResolvedEnvConfig {
 
     // None means ProcessResourceUsageConfig::default() owns the sample interval.
     process_resource_usage_sample_interval: Option<Duration>,
+
+    // Optional source: Some(true) registers it; otherwise leave the builder untouched.
+    socket_accept_queues_enabled: Option<bool>,
+
+    // None means SocketAcceptQueuesConfig::default() owns the sample interval.
+    socket_accept_queues_sample_interval: Option<Duration>,
 }
 
 struct RuntimeEnvConfig {
@@ -367,6 +378,9 @@ struct RuntimeEnvConfig {
     task_dump_idle_threshold: Option<Duration>,
     process_resource_usage_enabled: bool,
     process_resource_usage_sample_interval: Option<Duration>,
+    socket_accept_queues_enabled: Option<bool>,
+    #[cfg_attr(not(feature = "linux-socket"), allow(dead_code))]
+    socket_accept_queues_sample_interval: Option<Duration>,
 }
 
 fn parse_env_config(env: &impl EnvSource) -> ParsedEnvConfig {
@@ -409,6 +423,10 @@ fn parse_env_config(env: &impl EnvSource) -> ParsedEnvConfig {
         process_resource_usage_sample_interval: env
             .get_positive_u64(ENV_DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS)
             .map(Duration::from_millis),
+        socket_accept_queues_enabled: env.get_bool(ENV_DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED),
+        socket_accept_queues_sample_interval: env
+            .get_positive_u64(ENV_DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS)
+            .map(Duration::from_millis),
     }
 }
 
@@ -450,6 +468,8 @@ fn resolve_env_config(parsed: ParsedEnvConfig) -> ResolvedEnvConfig {
             .process_resource_usage_enabled
             .unwrap_or(DEFAULT_PROCESS_RESOURCE_USAGE_ENABLED),
         process_resource_usage_sample_interval: parsed.process_resource_usage_sample_interval,
+        socket_accept_queues_enabled: parsed.socket_accept_queues_enabled,
+        socket_accept_queues_sample_interval: parsed.socket_accept_queues_sample_interval,
     }
 }
 
@@ -603,6 +623,24 @@ fn apply_runtime_env<M>(
         runtime = runtime.with_process_resource_usage(process_resource_usage_config);
     }
 
+    #[cfg(feature = "linux-socket")]
+    if config.socket_accept_queues_enabled == Some(true) {
+        let socket_accept_queues_config = match config.socket_accept_queues_sample_interval {
+            Some(interval) => crate::telemetry::SocketAcceptQueuesConfig::builder()
+                .sample_interval(interval)
+                .build(),
+            None => crate::telemetry::SocketAcceptQueuesConfig::default(),
+        };
+        runtime = runtime.with_socket_accept_queues(socket_accept_queues_config);
+    }
+
+    #[cfg(not(feature = "linux-socket"))]
+    if config.socket_accept_queues_enabled == Some(true) {
+        warn(format_args!(
+            "dial9: socket accept queues requested but `linux-socket` feature is not enabled; ignoring"
+        ));
+    }
+
     #[cfg(feature = "cpu-profiling")]
     {
         use crate::telemetry::cpu_profile::{CpuProfilingConfig, SchedEventConfig};
@@ -688,6 +726,13 @@ impl Dial9Config {
     /// | `DIAL9_PROCESS_RESOURCE_USAGE_ENABLED` | `true` on Unix, `false` otherwise | Enable process resource usage sampling from `getrusage(RUSAGE_SELF)`. |
     /// | `DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS` | `100` | Sampling interval in milliseconds. |
     ///
+    /// Supported socket accept queue variables (`linux-socket` feature required):
+    ///
+    /// | Variable | Default | Meaning |
+    /// | --- | --- | --- |
+    /// | `DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED` | `false` | Enable TCP accept queue snapshots from Linux sock_diag. |
+    /// | `DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS` | `400` | Sampling interval in milliseconds. |
+    ///
     /// Supported task dump variables (capture requires the `taskdump` feature):
     ///
     /// | Variable | Default | Meaning |
@@ -723,6 +768,8 @@ impl Dial9Config {
             task_dump_idle_threshold,
             process_resource_usage_enabled,
             process_resource_usage_sample_interval,
+            socket_accept_queues_enabled,
+            socket_accept_queues_sample_interval,
         } = resolve_env_config(parse_env_config(env));
 
         let runtime_config = RuntimeEnvConfig {
@@ -736,6 +783,8 @@ impl Dial9Config {
             task_dump_idle_threshold,
             process_resource_usage_enabled,
             process_resource_usage_sample_interval,
+            socket_accept_queues_enabled,
+            socket_accept_queues_sample_interval,
         };
 
         // `from_env` only builds a disk writer for now.
@@ -1227,6 +1276,8 @@ mod tests {
         assert_eq!(parsed.task_dump_idle_threshold, None);
         assert_eq!(parsed.process_resource_usage_enabled, None);
         assert_eq!(parsed.process_resource_usage_sample_interval, None);
+        assert_eq!(parsed.socket_accept_queues_enabled, None);
+        assert_eq!(parsed.socket_accept_queues_sample_interval, None);
     }
 
     #[test]
@@ -1252,6 +1303,7 @@ mod tests {
             resolved.process_resource_usage_enabled,
             DEFAULT_PROCESS_RESOURCE_USAGE_ENABLED
         );
+        assert_eq!(resolved.socket_accept_queues_enabled, None);
 
         // Optional config/integrations remain absent unless explicitly requested.
         assert_eq!(resolved.runtime_name, None);
@@ -1263,6 +1315,7 @@ mod tests {
         assert_eq!(resolved.cpu_sample_hz, None);
         assert_eq!(resolved.task_dump_idle_threshold, None);
         assert_eq!(resolved.process_resource_usage_sample_interval, None);
+        assert_eq!(resolved.socket_accept_queues_sample_interval, None);
     }
 
     #[test]
@@ -1299,7 +1352,9 @@ mod tests {
                 .with("DIAL9_TASK_DUMP_ENABLED", "true")
                 .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "25")
                 .with("DIAL9_PROCESS_RESOURCE_USAGE_ENABLED", "true")
-                .with("DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS", "250"),
+                .with("DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS", "250")
+                .with("DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED", "true")
+                .with("DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS", "1000"),
         );
 
         assert_eq!(parsed.tokio_instrumentation_enabled, Some(false));
@@ -1322,6 +1377,11 @@ mod tests {
         assert_eq!(
             parsed.process_resource_usage_sample_interval,
             Some(Duration::from_millis(250))
+        );
+        assert_eq!(parsed.socket_accept_queues_enabled, Some(true));
+        assert_eq!(
+            parsed.socket_accept_queues_sample_interval,
+            Some(Duration::from_millis(1000))
         );
     }
 
@@ -1383,7 +1443,9 @@ mod tests {
                 .with("DIAL9_CPU_SAMPLE_HZ", "0")
                 .with("DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS", "wat")
                 .with("DIAL9_PROCESS_RESOURCE_USAGE_ENABLED", "maybe")
-                .with("DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS", "0"),
+                .with("DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS", "0")
+                .with("DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED", "maybe")
+                .with("DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS", "0"),
         );
 
         assert_eq!(parsed.enabled, None);
@@ -1398,6 +1460,8 @@ mod tests {
         assert_eq!(parsed.task_dump_idle_threshold, None);
         assert_eq!(parsed.process_resource_usage_enabled, None);
         assert_eq!(parsed.process_resource_usage_sample_interval, None);
+        assert_eq!(parsed.socket_accept_queues_enabled, None);
+        assert_eq!(parsed.socket_accept_queues_sample_interval, None);
     }
 
     #[test]
@@ -1534,6 +1598,57 @@ mod tests {
                 .iter()
                 .all(|source| source.name() != "process_resource_usage"),
             "explicit env opt-out should disable process resource usage"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-socket"))]
+    #[test]
+    fn env_config_does_not_enable_socket_accept_queues_by_default() {
+        let dir = tempfile::tempdir().expect("temporary trace directory should be created");
+        let trace_dir = dir
+            .path()
+            .to_str()
+            .expect("temporary trace directory path should be valid UTF-8");
+        let env = FakeEnv::default()
+            .with("DIAL9_ENABLED", "true")
+            .with("DIAL9_TRACE_DIR", trace_dir);
+
+        let cfg = Dial9Config::from_env_source(&env);
+        let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
+        let shared = rt.guard().shared().expect("telemetry should be enabled");
+        let sources = shared.sources.lock().unwrap();
+
+        assert!(
+            sources
+                .iter()
+                .all(|source| source.name() != "socket_accept_queues"),
+            "from_env should leave socket accept queues disabled by default"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-socket"))]
+    #[test]
+    fn env_config_can_enable_socket_accept_queues() {
+        let dir = tempfile::tempdir().expect("temporary trace directory should be created");
+        let trace_dir = dir
+            .path()
+            .to_str()
+            .expect("temporary trace directory path should be valid UTF-8");
+        let env = FakeEnv::default()
+            .with("DIAL9_ENABLED", "true")
+            .with("DIAL9_TRACE_DIR", trace_dir)
+            .with("DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED", "true");
+
+        let cfg = Dial9Config::from_env_source(&env);
+        let rt = TracedRuntime::try_new(cfg).expect("runtime should build");
+        let shared = rt.guard().shared().expect("telemetry should be enabled");
+        let sources = shared.sources.lock().unwrap();
+
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.name() == "socket_accept_queues"),
+            "explicit env opt-in should enable socket accept queues"
         );
     }
 

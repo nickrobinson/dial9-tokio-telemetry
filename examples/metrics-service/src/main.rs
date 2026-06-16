@@ -12,6 +12,8 @@ use dial9_tokio_telemetry::memory_profiling::{
     Dial9Allocator, MemoryProfiler, MemoryProfilingConfig,
 };
 #[cfg(target_os = "linux")]
+use dial9_tokio_telemetry::telemetry::SocketAcceptQueuesConfig;
+#[cfg(target_os = "linux")]
 use dial9_tokio_telemetry::telemetry::cpu_profile::{CpuProfilingConfig, SchedEventConfig};
 use dial9_tokio_telemetry::telemetry::{
     Dial9TokioHandle, DiskWriter, ProcessResourceUsageConfig, TaskDumpConfig, TracedRuntime,
@@ -237,7 +239,8 @@ fn main() -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     let traced_builder = traced_builder
         .with_cpu_profiling(CpuProfilingConfig::default())
-        .with_sched_events(SchedEventConfig::default().include_kernel(true));
+        .with_sched_events(SchedEventConfig::default().include_kernel(true))
+        .with_socket_accept_queues(SocketAcceptQueuesConfig::default());
 
     let (runtime, guard) = if let Some(bucket) = &args.s3_bucket {
         use dial9_tokio_telemetry::background_task::s3::S3Config;

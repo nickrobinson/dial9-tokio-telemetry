@@ -117,6 +117,13 @@ Process resource usage knobs:
 | `DIAL9_PROCESS_RESOURCE_USAGE_ENABLED` | `true` on Unix, `false` otherwise | Enable process resource usage sampling from `getrusage(RUSAGE_SELF)`. |
 | `DIAL9_PROCESS_RESOURCE_USAGE_SAMPLE_INTERVAL_MS` | `100` | Sampling interval in milliseconds. |
 
+Socket accept queue knobs (`linux-socket` feature required, Linux only):
+
+| Name | Default | Meaning |
+| --- | --- | --- |
+| `DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED` | `false` | Enable TCP accept queue snapshots from Linux sock_diag. |
+| `DIAL9_SOCKET_ACCEPT_QUEUES_SAMPLE_INTERVAL_MS` | `400` | Sampling interval in milliseconds. |
+
 Task dump knobs (capture requires the `taskdump` feature):
 
 | Name | Default | Meaning |
@@ -140,6 +147,7 @@ dial9 is fundamentally a central buffer that can collect data from different sou
 
 - [Tokio Events](#tokio-events): dial9 can capture poll, wake, and worker events from Tokio
 - [Process resource usage](#process-resource-usage-unix): dial9 can sample process-level resource usage on Unix
+- [Socket accept queues](#socket-accept-queues-linux-only): dial9 can sample pending TCP listener connections and backlog limits on Linux
 - [CPU profiling](#cpu-profiling-linux-only): dial9 can capture linux performance counters and events to produce flamegraphs
 - [Memory profiling](#memory-profiling): dial9 can sample heap allocations to produce allocation flamegraphs and detect leaks
 - [Tracing spans](#tracing-span-events-opt-in): dial9 can capture tracing spans to bring tracing context into your trace files
@@ -205,6 +213,31 @@ is enabled. To opt out, set:
 
 ```text
 DIAL9_PROCESS_RESOURCE_USAGE_ENABLED=false
+```
+
+### Socket accept queues (Linux only)
+
+With the `linux-socket` feature, dial9 can sample TCP listener accept
+queues from Linux `sock_diag`. Each snapshot records the listener address,
+pending connection count, and backlog limit for sockets owned by the current
+process.
+
+Programmatic builders leave socket accept queue sampling disabled unless you
+opt in:
+
+```rust,ignore
+use dial9_tokio_telemetry::telemetry::{SocketAcceptQueuesConfig, TracedRuntime};
+
+let (runtime, guard) = TracedRuntime::builder()
+    .with_socket_accept_queues(SocketAcceptQueuesConfig::default())
+    .build_and_start(tokio::runtime::Builder::new_multi_thread(), writer)?;
+```
+
+`Dial9Config::from_env()` also leaves this source disabled by default. To opt
+in, set:
+
+```text
+DIAL9_SOCKET_ACCEPT_QUEUES_ENABLED=true
 ```
 
 ### CPU profiling (Linux only)
