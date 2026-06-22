@@ -1692,6 +1692,7 @@ dependencies = [
  "aws-smithy-types",
  "axum",
  "axum-extra",
+ "bon",
  "clap",
  "flate2",
  "futures",
@@ -1710,6 +1711,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]
