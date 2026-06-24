@@ -1694,6 +1694,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "bon",
+ "bytes",
  "clap",
  "flate2",
  "futures",
