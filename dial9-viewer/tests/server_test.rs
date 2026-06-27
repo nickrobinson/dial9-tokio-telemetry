@@ -1,6 +1,8 @@
 use assert2::check;
 use dial9_viewer::server::{AppState, UploadLimits, router};
-use dial9_viewer::storage::{ListPage, LocalBackend, S3Backend, StorageBackend, StorageError};
+use dial9_viewer::storage::{
+    ListPage, LocalBackend, ObjectInfo, S3Backend, StorageBackend, StorageError,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,6 +31,14 @@ impl StorageBackend for FakeBackend {
         })
     }
 
+    fn list_objects_all(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
     fn list_prefixes(
         &self,
         _bucket: &str,
@@ -43,6 +53,15 @@ impl StorageBackend for FakeBackend {
         _key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, StorageError>> + Send + '_>> {
         Box::pin(async { Err(StorageError::NotFound("fake".into())) })
+    }
+
+    fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -105,6 +124,14 @@ impl StorageBackend for ErroringBackend {
         Box::pin(async { Err(StorageError::Other("default backend used".into())) })
     }
 
+    fn list_objects_all(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
     fn list_prefixes(
         &self,
         _bucket: &str,
@@ -118,6 +145,15 @@ impl StorageBackend for ErroringBackend {
         _bucket: &str,
         _key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
+    fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
         Box::pin(async { Err(StorageError::Other("default backend used".into())) })
     }
 }
