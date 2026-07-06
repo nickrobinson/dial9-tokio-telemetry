@@ -111,33 +111,45 @@ pub struct BrowseMetrics {
 }
 
 /// Detail for `GET /api/flamegraph`.
+///
+/// The endpoint streams (SSE): op detail is attached at response-head time, so
+/// these are RESOLVE-TIME values — the scope size and how much of it was
+/// already folded when the stream opened. What the stream folds afterwards is
+/// not visible here (the middleware reads the extension before the body runs).
 #[derive(Clone)]
 #[metrics(subfield)]
 pub struct FlamegraphMetrics {
     /// Source segment files in scope.
     files_matched: u32,
-    /// Files actually folded into the returned tree.
+    /// Files already folded when the stream opened (the instantly-served
+    /// snapshot).
     files_folded: u32,
-    /// Coverage percent (`files_folded / files_matched * 100`). A `200` with
-    /// low coverage is a *degraded* result, not a healthy one — alarm on a low
-    /// value to catch under-folded flamegraphs the status code can't reveal.
+    /// Resolve-time coverage percent (`files_folded / files_matched * 100`).
+    /// Persistently low values mean scopes keep opening cold — folds are not
+    /// sticking (e.g. output-bucket write failures) or scopes never repeat.
     #[metrics(unit = metrique::unit::Percent)]
     coverage_pct: f64,
-    /// Stack samples folded into the tree.
-    samples: u64,
+    /// Stack samples folded into the tree. `None` (absent) on the streaming
+    /// path, where samples are only known after part-files are read inside the
+    /// stream body.
+    samples: Option<u64>,
 }
 
 /// Detail for `GET /api/tokio-stats`.
+///
+/// Streaming endpoint: resolve-time values, same caveat as
+/// [`FlamegraphMetrics`].
 #[derive(Clone)]
 #[metrics(subfield)]
 pub struct TokioStatsMetrics {
     /// Source segment files in scope.
     files_matched: u32,
-    /// Files actually folded into the result.
+    /// Files already folded when the stream opened.
     files_folded: u32,
     /// Long polls above the notable-duration floor (the signal the endpoint
-    /// exists to surface).
-    notable_polls: u64,
+    /// exists to surface). `None` (absent) on the streaming path, where polls
+    /// are only read inside the stream body.
+    notable_polls: Option<u64>,
 }
 
 /// Standalone metric for `GET /api/object`, emitted when the response body
@@ -211,7 +223,7 @@ impl OperationMetrics {
 
     /// Flamegraph detail. `coverage_pct` is computed here from the folded /
     /// matched file counts (0.0 when nothing matched, to avoid NaN).
-    pub fn flamegraph(files_matched: u32, files_folded: u32, samples: u64) -> Self {
+    pub fn flamegraph(files_matched: u32, files_folded: u32, samples: Option<u64>) -> Self {
         let coverage_pct = if files_matched == 0 {
             0.0
         } else {
@@ -226,7 +238,7 @@ impl OperationMetrics {
     }
 
     /// Tokio-stats detail.
-    pub fn tokio_stats(files_matched: u32, files_folded: u32, notable_polls: u64) -> Self {
+    pub fn tokio_stats(files_matched: u32, files_folded: u32, notable_polls: Option<u64>) -> Self {
         Self::TokioStats(TokioStatsMetrics {
             files_matched,
             files_folded,
@@ -425,7 +437,7 @@ mod tests {
         // 50 of 200 files folded → 25% coverage.
         let e = run_with_op(
             "/api/flamegraph",
-            OperationMetrics::flamegraph(200, 50, 9000),
+            OperationMetrics::flamegraph(200, 50, Some(9000)),
         )
         .await;
         assert_eq!(e.values["op_detail"], "Flamegraph");
@@ -436,9 +448,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flamegraph_unknown_samples_are_absent_not_zero() {
+        // The streaming path can't know samples at response-head time; the
+        // field must be ABSENT (never a fake 0 that would drag averages down).
+        let e = run_with_op(
+            "/api/flamegraph",
+            OperationMetrics::flamegraph(200, 50, None),
+        )
+        .await;
+        assert!(!e.metrics.contains_key("samples"));
+        assert_eq!(e.metrics["coverage_pct"].as_f64(), 25.0);
+    }
+
+    #[tokio::test]
     async fn flamegraph_coverage_is_zero_when_nothing_matched() {
         // Guard against NaN (0/0) when the scope matched no files.
-        let e = run_with_op("/api/flamegraph", OperationMetrics::flamegraph(0, 0, 0)).await;
+        let e = run_with_op("/api/flamegraph", OperationMetrics::flamegraph(0, 0, None)).await;
         assert_eq!(e.metrics["coverage_pct"].as_f64(), 0.0);
     }
 
