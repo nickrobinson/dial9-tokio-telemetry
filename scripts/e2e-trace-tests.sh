@@ -71,6 +71,9 @@ node dial9-viewer/ui/test_all_skills_snippets.js
 echo "--- Checking flamegraph API refinement helpers ---"
 node dial9-viewer/ui/test_flamegraph_api.js
 
+echo "--- Checking flamegraph diff helpers (merge, color, scope-link codec) ---"
+node dial9-viewer/ui/test_flamegraph_diff.js
+
 echo "--- Checking tokio-stats API helpers (exemplar link + coverage) ---"
 node dial9-viewer/ui/test_tokio_stats_api.js
 
