@@ -55,6 +55,10 @@
 //! ```
 
 pub mod offline_symbolize;
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 mod rate_limit;
 mod sampler;
 mod symbolize;
@@ -78,9 +82,15 @@ pub use sys::PerfSampler;
 pub use sys::resolve_symbol;
 
 // ctimer fallback status and thread registration
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 pub use sys::is_ctimer_active;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+)))]
 pub fn is_ctimer_active() -> bool {
     false
 }
@@ -89,7 +99,10 @@ pub fn is_ctimer_active() -> bool {
 ///
 /// No-op unless ctimer fallback is active (perf uses `inherit` instead).
 pub fn register_current_thread() -> Result<(), std::io::Error> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ))]
     if is_ctimer_active() {
         return crate::sys::fp_profiler::ctimer::register_thread();
     }
@@ -100,14 +113,20 @@ pub fn register_current_thread() -> Result<(), std::io::Error> {
 ///
 /// No-op unless ctimer fallback is active.
 pub fn unregister_current_thread() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ))]
     if is_ctimer_active() {
         crate::sys::fp_profiler::ctimer::unregister_thread();
     }
 }
 
 // blazesym-dependent APIs
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 pub use sys::{resolve_symbol_with_maps, resolve_symbols_with_maps};
 
 #[cfg(feature = "dial9-source")]
@@ -122,7 +141,13 @@ pub use memory_profiling::{
 };
 
 /// Internal module exposed only for benchmarks. Not part of the public API.
-#[cfg(all(target_os = "linux", feature = "__internal-bench"))]
+#[cfg(all(
+    any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ),
+    feature = "__internal-bench"
+))]
 #[doc(hidden)]
 pub mod __bench_internals {
     pub use crate::sys::fp_profiler::install_handler;

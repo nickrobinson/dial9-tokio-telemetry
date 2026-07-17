@@ -26,6 +26,15 @@ fn main() {
         }
     };
 
+    // Android's automatic ctimer fallback intentionally avoids the ART main
+    // thread. This example is a standalone native process, so tracking its
+    // main thread is safe and gives the emulator smoke test useful work.
+    #[cfg(target_os = "android")]
+    sampler.track_current_thread().unwrap_or_else(|e| {
+        eprintln!("Failed to track the Android main thread: {e}");
+        std::process::exit(1);
+    });
+
     // --- Do some work ---
     eprintln!("Running workload...");
     let result = do_work();
@@ -42,7 +51,7 @@ fn main() {
         eprintln!(
             "  RUSTFLAGS=\"-C force-frame-pointers=yes\" cargo run --release --example basic"
         );
-        return;
+        std::process::exit(1);
     }
 
     // --- Print a few raw samples ---

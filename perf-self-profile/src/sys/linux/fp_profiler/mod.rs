@@ -1,6 +1,10 @@
 //! Userspace frame-pointer profiling infrastructure.
 //! x86_64 and aarch64 only.
 
+#[cfg(target_os = "android")]
+pub mod android_sigchain;
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+pub mod bionic_arm64;
 pub mod ctimer;
 pub mod sample_buffer;
 pub mod unwind;
@@ -15,8 +19,11 @@ compile_error!(
 );
 
 mod supported {
+    #[cfg(not(target_os = "android"))]
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    #[cfg(not(target_os = "android"))]
+    use std::sync::atomic::AtomicPtr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::SAFE_LOAD_FAULT;
 
@@ -69,13 +76,19 @@ mod supported {
     }
 
     static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+    #[cfg(not(target_os = "android"))]
     static OLD_HANDLER: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
+    /// `true` after we have successfully registered with `libsigchain`. On
+    /// non-Android platforms this is always `false` and unused.
+    #[cfg(target_os = "android")]
+    static SIGCHAIN_REGISTERED: AtomicBool = AtomicBool::new(false);
 
     /// Install our SIGSEGV handler, chaining to whatever was previously
-    /// registered.
+    /// registered (or registering with libsigchain on Android).
     ///
     /// # Safety
     /// Modifies process-global signal state. Call once during initialization.
+    #[cfg(not(target_os = "android"))]
     pub unsafe fn install_handler() -> Result<(), std::io::Error> {
         if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
             return Ok(()); // already installed
@@ -102,6 +115,39 @@ mod supported {
         Ok(())
     }
 
+    /// Android variant: register our safe_load fault handler with ART's
+    /// `libsigchain` via `AddSpecialSignalHandlerFn` so it runs BEFORE the
+    /// libsigchain-owned SIGSEGV dispatcher. If libsigchain isn't loaded
+    /// (e.g. a plain adb-shell binary, no ART), returns `Ok(())` but leaves
+    /// `SIGCHAIN_REGISTERED` cleared — callers gate FP unwinding on
+    /// [`fp_unwind_supported`] and degrade to PC-only sampling.
+    ///
+    /// We never call `sigaction` directly on Android: when libsigchain *is*
+    /// loaded it interposes the syscall and silently swallows safe_load
+    /// faults, which is exactly the bug we're trying to avoid.
+    #[cfg(target_os = "android")]
+    pub unsafe fn install_handler() -> Result<(), std::io::Error> {
+        if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+            return Ok(()); // already attempted
+        }
+        // SAFETY: `sigchain_safe_load_handler` is async-signal-safe, returns
+        // `false` for non-safe_load faults, and lives for the lifetime of the
+        // process.
+        let ok = unsafe { super::android_sigchain::try_register(sigchain_safe_load_handler) };
+        if ok {
+            SIGCHAIN_REGISTERED.store(true, Ordering::SeqCst);
+            tracing::info!(
+                "libsigchain safe_load handler registered; frame-pointer unwinding enabled"
+            );
+        } else {
+            tracing::info!(
+                "libsigchain not loaded; CPU sampler will use PC-only callchains \
+                 (this is the safe path for plain adb-shell binaries)"
+            );
+        }
+        Ok(())
+    }
+
     /// Check whether our SIGSEGV handler is still the active handler for
     /// SIGSEGV. Returns `true` if the currently-installed handler matches
     /// the one we registered in [`install_handler`].
@@ -111,6 +157,7 @@ mod supported {
     /// that case so they can reinstall or skip capture.
     ///
     /// Performs one `sigaction` syscall; not suitable for hot paths.
+    #[cfg(not(target_os = "android"))]
     pub fn handler_is_installed() -> bool {
         // If we never installed, we cannot be installed.
         if !HANDLER_INSTALLED.load(Ordering::SeqCst) {
@@ -131,25 +178,54 @@ mod supported {
         current.sa_sigaction == expected
     }
 
+    /// Android variant: we can't introspect libsigchain's internal table via
+    /// `sigaction`, so we track our own registration state. Once
+    /// `AddSpecialSignalHandlerFn` accepts our handler we assume it stays
+    /// registered for the lifetime of the process.
+    #[cfg(target_os = "android")]
+    pub fn handler_is_installed() -> bool {
+        SIGCHAIN_REGISTERED.load(Ordering::SeqCst)
+    }
+
+    /// Shared safe_load fault-recovery logic. Returns `true` if the faulting
+    /// PC was inside the `safe_load` instruction window and the ucontext was
+    /// fixed up to resume at `safe_load_end` with `SAFE_LOAD_FAULT` in the
+    /// result register; `false` otherwise (caller should pass the signal on).
+    ///
+    /// # Safety
+    /// `ucontext` must be the `ucontext_t*` provided by the kernel to an
+    /// SA_SIGINFO SIGSEGV handler.
+    #[inline]
+    unsafe fn try_fixup_safe_load(ucontext: *mut libc::c_void) -> bool {
+        // SAFETY: caller passes a kernel-provided ucontext; safe_load_start/end
+        // are linker-defined code labels in this module.
+        unsafe {
+            let pc = get_pc(ucontext);
+            let start = &safe_load_start as *const u8 as usize;
+            let end = &safe_load_end as *const u8 as usize;
+            if pc >= start && pc < end {
+                set_pc(ucontext, end);
+                set_result_reg(ucontext, SAFE_LOAD_FAULT);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
     /// SIGSEGV handler for `safe_load`: if the faulting PC is within the
     /// `safe_load_start..safe_load_end` instruction range, it skips the faulting
     /// load, and resumes execution.
     /// Otherwise, it chains to the previously installed handler.
+    #[cfg(not(target_os = "android"))]
     extern "C" fn sigsegv_handler(
         signo: libc::c_int,
         info: *mut libc::siginfo_t,
         ucontext: *mut libc::c_void,
     ) {
-        // SAFETY: In a SA_SIGINFO SIGSEGV handler, kernel provides a valid ucontext_t;
-        // safe_load_start/end are linker-defined code labels in this module.
+        // SAFETY: In a SA_SIGINFO SIGSEGV handler, kernel provides a valid ucontext_t.
         unsafe {
-            let pc = get_pc(ucontext);
-            let start = &safe_load_start as *const u8 as usize;
-            let end = &safe_load_end as *const u8 as usize;
-
-            if pc >= start && pc < end {
-                set_pc(ucontext, end);
-                set_result_reg(ucontext, SAFE_LOAD_FAULT);
+            if try_fixup_safe_load(ucontext) {
                 return;
             }
 
@@ -180,6 +256,27 @@ mod supported {
                 }
             }
         }
+    }
+
+    /// libsigchain "special handler" variant of [`sigsegv_handler`]. Returns
+    /// `true` if it claimed the fault (safe_load recovered via ucontext
+    /// mutation) — libsigchain then returns to the modified ucontext. Returns
+    /// `false` for any other SIGSEGV so libsigchain can forward to ART and
+    /// the genuine crash path runs unmodified.
+    #[cfg(target_os = "android")]
+    extern "C" fn sigchain_safe_load_handler(
+        _signo: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        ucontext: *mut libc::c_void,
+    ) -> bool {
+        // SAFETY: libsigchain passes the kernel-provided ucontext through unchanged.
+        unsafe { try_fixup_safe_load(ucontext) }
+    }
+
+    /// Whether the Android frame-pointer unwinder registered with libsigchain.
+    #[cfg(target_os = "android")]
+    pub fn fp_unwind_supported() -> bool {
+        SIGCHAIN_REGISTERED.load(Ordering::SeqCst)
     }
 
     // Architecture-specific ucontext access
@@ -221,4 +318,6 @@ mod supported {
     }
 }
 
+#[cfg(target_os = "android")]
+pub use supported::fp_unwind_supported;
 pub use supported::{handler_is_installed, install_handler, load};
