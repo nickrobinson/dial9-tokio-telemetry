@@ -1,6 +1,8 @@
 use crate::telemetry::task_metadata::TaskId;
+#[cfg(any(test, feature = "taskdump"))]
+use dial9_trace_format::InternedStackFrames;
 use dial9_trace_format::types::{EventEncoder, FieldType};
-use dial9_trace_format::{InternedStackFrames, InternedString, TraceEvent, TraceField};
+use dial9_trace_format::{InternedString, TraceEvent, TraceField};
 use serde::Serialize;
 use std::fmt;
 use std::io::{self, Write};
@@ -220,6 +222,7 @@ pub(crate) struct TaskTerminateEvent {
 
 /// Wire-format event for a task dump: async backtrace captured at a yield point
 /// after the task stayed idle past the configured threshold.
+#[cfg(any(test, feature = "taskdump"))]
 #[derive(TraceEvent)]
 #[traceevent(wire_slot)]
 pub(crate) struct TaskDumpEvent {
@@ -252,7 +255,7 @@ pub(crate) use dial9_core::format::{ClockSyncEvent, SegmentMetadataEvent};
 
 /// Decode all events from a `dial9-trace-format` byte slice into `Dial9Event`s.
 /// Test-only helper used by internal tests across multiple modules.
-#[cfg(test)]
+#[cfg(all(test, any(not(shuttle), feature = "taskdump")))]
 pub(crate) fn decode_events(
     data: &[u8],
 ) -> std::io::Result<Vec<crate::telemetry::analysis_events::Dial9Event>> {

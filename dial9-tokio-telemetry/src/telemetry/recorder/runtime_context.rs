@@ -48,6 +48,7 @@ thread_local! {
     static POLL_START_TS: Cell<Option<NonZeroU64>> = const { Cell::new(None) };
     /// Last timestamp returned by `poll_start_ts_monotonic`. Ensures strictly
     /// increasing values within a thread by bumping +1ns on ties.
+    #[cfg(any(test, feature = "taskdump"))]
     static LAST_TS: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -106,6 +107,7 @@ fn advance_park_counter(counter: u64, rate: u64) -> (u64, bool) {
 ///
 /// Used by:
 /// - the task-dump idle/wake bookkeeping in [`crate::task_dumped`].
+#[cfg(any(test, feature = "taskdump"))]
 pub(crate) fn poll_start_ts_monotonic() -> u64 {
     let raw = POLL_START_TS.with(|c| c.get()).map_or_else(
         crate::telemetry::events::clock_monotonic_ns,

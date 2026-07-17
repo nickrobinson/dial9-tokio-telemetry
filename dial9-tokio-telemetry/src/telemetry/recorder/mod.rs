@@ -7,6 +7,7 @@ pub(crate) use dial9_core::source;
 
 pub(crate) use runtime_context::RuntimeContext;
 pub use runtime_context::current_worker_id;
+#[cfg(any(test, feature = "taskdump"))]
 pub(crate) use runtime_context::poll_start_ts_monotonic;
 
 pub use builder::{
@@ -23,9 +24,9 @@ mod tokio_hooks;
 pub use tokio_hooks::TokioHooks;
 
 // Re-exports for internal test access
-#[cfg(test)]
+#[cfg(all(test, not(shuttle)))]
 use builder::PipelineConfig;
-#[cfg(test)]
+#[cfg(all(test, not(shuttle)))]
 use handle::InstrumentedSpawnGuard;
 
 use dial9_core::handle::{clear_tl_handle, set_tl_handle};

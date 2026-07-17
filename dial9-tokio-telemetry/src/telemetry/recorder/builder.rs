@@ -587,6 +587,7 @@ impl<M, Mode: WriterMode> TracedRuntimeBuilder<HasTracePath, M, Mode> {
         // When the writer is namespaced, the S3 keys and the embedded segment
         // metadata must use the same boot_id as the on-disk `{boot_id}/`
         // directory, so a local segment and its upload share one identity.
+        #[allow(unused_mut)]
         let mut pipeline = self.pipeline;
         let mut segment_metadata = self.segment_metadata;
         if let Some(boot_id) = writer.boot_id() {
@@ -837,11 +838,11 @@ pub(super) fn assemble_processors(
 
 #[cfg(feature = "linux-socket")]
 fn push_socket_accept_queues_source(
-    shared: &Arc<SharedState>,
+    _shared: &Arc<SharedState>,
     config: crate::telemetry::SocketAcceptQueuesConfig,
 ) {
     #[cfg(target_os = "linux")]
-    shared.push_source(Box::new(
+    _shared.push_source(Box::new(
         crate::telemetry::socket_accept_queues::SocketAcceptQueuesSource::new(config),
     ));
 
