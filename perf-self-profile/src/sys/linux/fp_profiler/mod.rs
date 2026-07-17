@@ -19,9 +19,7 @@ compile_error!(
 );
 
 mod supported {
-    #[cfg(not(target_os = "android"))]
     use std::ptr;
-    #[cfg(not(target_os = "android"))]
     use std::sync::atomic::AtomicPtr;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -76,24 +74,15 @@ mod supported {
     }
 
     static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
-    #[cfg(not(target_os = "android"))]
     static OLD_HANDLER: AtomicPtr<libc::sigaction> = AtomicPtr::new(ptr::null_mut());
     /// `true` after we have successfully registered with `libsigchain`. On
     /// non-Android platforms this is always `false` and unused.
     #[cfg(target_os = "android")]
     static SIGCHAIN_REGISTERED: AtomicBool = AtomicBool::new(false);
+    #[cfg(target_os = "android")]
+    static DIRECT_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-    /// Install our SIGSEGV handler, chaining to whatever was previously
-    /// registered (or registering with libsigchain on Android).
-    ///
-    /// # Safety
-    /// Modifies process-global signal state. Call once during initialization.
-    #[cfg(not(target_os = "android"))]
-    pub unsafe fn install_handler() -> Result<(), std::io::Error> {
-        if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
-            return Ok(()); // already installed
-        }
-
+    unsafe fn install_sigaction_handler() -> Result<(), std::io::Error> {
         let mut new_action: libc::sigaction = unsafe { std::mem::zeroed() };
         new_action.sa_sigaction = sigsegv_handler as *const () as usize;
         // SA_NODEFER: safe_load may fault inside SIGPROF, without this the second
@@ -107,7 +96,6 @@ mod supported {
         if unsafe { libc::sigaction(libc::SIGSEGV, &new_action, old_storage) } != 0 {
             let err = std::io::Error::last_os_error();
             unsafe { drop(Box::from_raw(old_storage)) };
-            HANDLER_INSTALLED.store(false, Ordering::SeqCst);
             return Err(err);
         }
 
@@ -115,16 +103,28 @@ mod supported {
         Ok(())
     }
 
+    /// Install our SIGSEGV handler, chaining to whatever was previously
+    /// registered (or registering with libsigchain on Android).
+    ///
+    /// # Safety
+    /// Modifies process-global signal state. Call once during initialization.
+    #[cfg(not(target_os = "android"))]
+    pub unsafe fn install_handler() -> Result<(), std::io::Error> {
+        if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+            return Ok(()); // already installed
+        }
+
+        if let Err(err) = unsafe { install_sigaction_handler() } {
+            HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Android variant: register our safe_load fault handler with ART's
     /// `libsigchain` via `AddSpecialSignalHandlerFn` so it runs BEFORE the
     /// libsigchain-owned SIGSEGV dispatcher. If libsigchain isn't loaded
-    /// (e.g. a plain adb-shell binary, no ART), returns `Ok(())` but leaves
-    /// `SIGCHAIN_REGISTERED` cleared — callers gate FP unwinding on
-    /// [`fp_unwind_supported`] and degrade to PC-only sampling.
-    ///
-    /// We never call `sigaction` directly on Android: when libsigchain *is*
-    /// loaded it interposes the syscall and silently swallows safe_load
-    /// faults, which is exactly the bug we're trying to avoid.
+    /// (e.g. a plain adb-shell binary, no ART), installs the direct handler.
     #[cfg(target_os = "android")]
     pub unsafe fn install_handler() -> Result<(), std::io::Error> {
         if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
@@ -140,10 +140,12 @@ mod supported {
                 "libsigchain safe_load handler registered; frame-pointer unwinding enabled"
             );
         } else {
-            tracing::info!(
-                "libsigchain not loaded; CPU sampler will use PC-only callchains \
-                 (this is the safe path for plain adb-shell binaries)"
-            );
+            if let Err(err) = unsafe { install_sigaction_handler() } {
+                HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+            DIRECT_HANDLER_INSTALLED.store(true, Ordering::SeqCst);
+            tracing::info!("libsigchain not loaded; direct safe_load handler registered");
         }
         Ok(())
     }
@@ -184,7 +186,15 @@ mod supported {
     /// registered for the lifetime of the process.
     #[cfg(target_os = "android")]
     pub fn handler_is_installed() -> bool {
-        SIGCHAIN_REGISTERED.load(Ordering::SeqCst)
+        if SIGCHAIN_REGISTERED.load(Ordering::SeqCst) {
+            return true;
+        }
+        if !DIRECT_HANDLER_INSTALLED.load(Ordering::SeqCst) {
+            return false;
+        }
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::sigaction(libc::SIGSEGV, ptr::null(), &mut current) };
+        rc == 0 && current.sa_sigaction == sigsegv_handler as *const () as usize
     }
 
     /// Shared safe_load fault-recovery logic. Returns `true` if the faulting
@@ -217,7 +227,6 @@ mod supported {
     /// `safe_load_start..safe_load_end` instruction range, it skips the faulting
     /// load, and resumes execution.
     /// Otherwise, it chains to the previously installed handler.
-    #[cfg(not(target_os = "android"))]
     extern "C" fn sigsegv_handler(
         signo: libc::c_int,
         info: *mut libc::siginfo_t,
@@ -273,10 +282,11 @@ mod supported {
         unsafe { try_fixup_safe_load(ucontext) }
     }
 
-    /// Whether the Android frame-pointer unwinder registered with libsigchain.
+    /// Whether Android frame-pointer unwinding has safe fault recovery.
     #[cfg(target_os = "android")]
     pub fn fp_unwind_supported() -> bool {
         SIGCHAIN_REGISTERED.load(Ordering::SeqCst)
+            || DIRECT_HANDLER_INSTALLED.load(Ordering::SeqCst)
     }
 
     // Architecture-specific ucontext access
@@ -299,22 +309,37 @@ mod supported {
         unsafe { (*uc).uc_mcontext.gregs[libc::REG_RAX as usize] = val as i64 };
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "android")))]
     unsafe fn get_pc(uc: *mut libc::c_void) -> usize {
         let uc = uc as *mut libc::ucontext_t;
         unsafe { (*uc).uc_mcontext.pc as usize }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "android")))]
     unsafe fn set_pc(uc: *mut libc::c_void, pc: usize) {
         let uc = uc as *mut libc::ucontext_t;
         unsafe { (*uc).uc_mcontext.pc = pc as u64 };
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(target_os = "android")))]
     unsafe fn set_result_reg(uc: *mut libc::c_void, val: usize) {
         let uc = uc as *mut libc::ucontext_t;
         unsafe { (*uc).uc_mcontext.regs[0] = val as u64 };
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "android"))]
+    unsafe fn get_pc(uc: *mut libc::c_void) -> usize {
+        unsafe { super::bionic_arm64::android_ucontext_pc(uc) as usize }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "android"))]
+    unsafe fn set_pc(uc: *mut libc::c_void, pc: usize) {
+        unsafe { super::bionic_arm64::android_ucontext_set_pc(uc, pc as u64) };
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "android"))]
+    unsafe fn set_result_reg(uc: *mut libc::c_void, val: usize) {
+        unsafe { super::bionic_arm64::android_ucontext_set_result_reg(uc, val as u64) };
     }
 }
 

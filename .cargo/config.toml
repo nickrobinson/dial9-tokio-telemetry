@@ -1,7 +1,2 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
-target-dir = "target"
-
-[profile.release-with-debug]
-inherits = "release"
-debug = "line-tables-only"

@@ -22,6 +22,16 @@ pub unsafe fn android_ucontext_pc(ucontext: *mut c_void) -> u64 {
     unsafe { (*ucontext.cast::<struct_ucontext>()).uc_mcontext.pc }
 }
 
+/// Set the PC register in an Android aarch64 ucontext.
+pub unsafe fn android_ucontext_set_pc(ucontext: *mut c_void, pc: u64) {
+    unsafe { (*ucontext.cast::<struct_ucontext>()).uc_mcontext.pc = pc };
+}
+
+/// Set `x0`, the return-value register, in an Android aarch64 ucontext.
+pub unsafe fn android_ucontext_set_result_reg(ucontext: *mut c_void, value: u64) {
+    unsafe { (*ucontext.cast::<struct_ucontext>()).uc_mcontext.regs[0] = value };
+}
+
 /// Read `(pc, fp, sp)` from an Android aarch64 ucontext. `fp` is `x29` (the
 /// AAPCS64 frame pointer register).
 #[inline]

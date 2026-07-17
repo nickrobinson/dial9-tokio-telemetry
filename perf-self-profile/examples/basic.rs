@@ -6,6 +6,8 @@
 //! You may need:
 //!   echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
+#[cfg(target_os = "android")]
+use dial9_perf_self_profile::register_current_thread;
 use dial9_perf_self_profile::{
     EventSource, PerfSampler, SamplerConfig, SamplingMode, resolve_symbol,
 };
@@ -30,7 +32,7 @@ fn main() {
     // thread. This example is a standalone native process, so tracking its
     // main thread is safe and gives the emulator smoke test useful work.
     #[cfg(target_os = "android")]
-    sampler.track_current_thread().unwrap_or_else(|e| {
+    register_current_thread().unwrap_or_else(|e| {
         eprintln!("Failed to track the Android main thread: {e}");
         std::process::exit(1);
     });
@@ -51,6 +53,15 @@ fn main() {
         eprintln!(
             "  RUSTFLAGS=\"-C force-frame-pointers=yes\" cargo run --release --example basic"
         );
+        std::process::exit(1);
+    }
+    let max_depth = samples
+        .iter()
+        .map(|sample| sample.callchain.len())
+        .max()
+        .expect("samples is not empty");
+    if max_depth < 10 {
+        eprintln!("Stack traces are too shallow: deepest sample has {max_depth} frame(s)");
         std::process::exit(1);
     }
 

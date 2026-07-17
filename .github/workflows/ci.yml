@@ -82,8 +82,7 @@ jobs:
           export RANLIB="$toolchain/llvm-ranlib"
           export CC_aarch64_linux_android="$toolchain/aarch64-linux-android$ANDROID_API-clang"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
-          cargo build --profile release-with-debug \
-            -p dial9-perf-self-profile \
+          cargo build -p dial9-perf-self-profile \
             --example basic \
             --target aarch64-linux-android
 
