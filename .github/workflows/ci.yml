@@ -64,16 +64,11 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-  android-aarch64-smoke:
-    name: Android aarch64 smoke
-    runs-on: macos-14
-    # Standard macOS ARM runners have no nested virtualization. Keep this
-    # experimental until emulator boot time and reliability are established.
-    continue-on-error: true
-    timeout-minutes: 30
+  android-aarch64-build:
+    name: Android aarch64 build
+    runs-on: ubuntu-latest
     env:
       ANDROID_API: "30"
-      DIAL9_FORCE_CTIMER: "1"
       NDK_VERSION: "27.3.13750724"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -81,18 +76,19 @@ jobs:
         with:
           toolchain: ${{ env.STABLE_TOOLCHAIN }}
           targets: aarch64-linux-android
-      - name: Run ctimer smoke test on Android
-        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
-        with:
-          api-level: 30
-          arch: arm64-v8a
-          target: default
-          ndk: ${{ env.NDK_VERSION }}
-          script: |
-            NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" \
-              CARGO_PKG=dial9-perf-self-profile \
-              EXAMPLE=basic \
-              examples/android_build.sh
+      - name: Install Android NDK
+        run: sdkmanager --install "ndk;$NDK_VERSION"
+      - name: Build CPU profiling example
+        run: |
+          toolchain="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export AR="$toolchain/llvm-ar"
+          export RANLIB="$toolchain/llvm-ranlib"
+          export CC_aarch64_linux_android="$toolchain/aarch64-linux-android$ANDROID_API-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          cargo build --profile release-with-debug \
+            -p dial9-perf-self-profile \
+            --example basic \
+            --target aarch64-linux-android
 
   # TEMPORARY: the nightly build is disabled while aws-runtime fails to compile
   # on nightly rustc (E0282 type-inference regression upstream). This gate skips
@@ -345,7 +341,7 @@ jobs:
   ci-pass:
     name: CI Pass
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, build, feature-check, check-docs, trace-integrity, asan, ecs-sim, shuttle, package]
+    needs: [fmt, clippy, build, android-aarch64-build, feature-check, check-docs, trace-integrity, asan, ecs-sim, shuttle, package]
     if: always()
     steps:
       - run: |
