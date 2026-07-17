@@ -14,8 +14,8 @@ use super::fp_profiler::{
 };
 use super::gettid;
 
-use libc::{timer_getoverrun, timer_settime};
 use super::sampler::SamplerBackend;
+use libc::{timer_getoverrun, timer_settime};
 
 use crate::sampler::{Sample, SamplerConfig};
 

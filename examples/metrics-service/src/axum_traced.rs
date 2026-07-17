@@ -5,7 +5,10 @@ use std::{convert::Infallible, fmt::Debug, future::Future, io, marker::PhantomDa
 
 use axum::serve::Listener;
 use axum_core::{body::Body, extract::Request, response::Response};
-use dial9_tokio_telemetry::telemetry::TelemetryHandle;
+use dial9_tokio_telemetry::telemetry::{
+    Dial9Handle, Dial9TokioHandle, Encodable, ThreadLocalEncoder, clock_monotonic_ns,
+};
+use dial9_trace_format::{InternedString, TraceEvent};
 use futures_util::FutureExt as _;
 use hyper::body::Incoming;
 use hyper_util::{rt::TokioIo, server::conn::auto::Builder, service::TowerToHyperService};
@@ -13,7 +16,59 @@ use tokio::sync::watch;
 use tower::ServiceExt as _;
 use tower_service::Service;
 
-/// A hyper executor that routes spawns through dial9's TelemetryHandle
+// ── Custom connection lifecycle events ──────────────────────────────────────
+
+struct ConnectionAccepted {
+    timestamp_ns: u64,
+    remote_addr: String,
+}
+
+#[derive(TraceEvent)]
+struct ConnectionAcceptedWire {
+    #[traceevent(timestamp)]
+    timestamp_ns: u64,
+    remote_addr: InternedString,
+}
+
+impl Encodable for ConnectionAccepted {
+    fn encode(&self, enc: &mut ThreadLocalEncoder<'_>) {
+        let remote_addr = enc.intern_string(&self.remote_addr);
+        enc.encode(&ConnectionAcceptedWire {
+            timestamp_ns: self.timestamp_ns,
+            remote_addr,
+        });
+    }
+}
+
+struct ConnectionClosed {
+    timestamp_ns: u64,
+    remote_addr: String,
+    duration_us: u64,
+}
+
+#[derive(TraceEvent)]
+struct ConnectionClosedWire {
+    #[traceevent(timestamp)]
+    timestamp_ns: u64,
+    remote_addr: InternedString,
+    /// Rendered as a human-friendly duration in the viewer via the unit
+    /// annotation.
+    #[traceevent(unit = "us")]
+    duration_us: u64,
+}
+
+impl Encodable for ConnectionClosed {
+    fn encode(&self, enc: &mut ThreadLocalEncoder<'_>) {
+        let remote_addr = enc.intern_string(&self.remote_addr);
+        enc.encode(&ConnectionClosedWire {
+            timestamp_ns: self.timestamp_ns,
+            remote_addr,
+            duration_us: self.duration_us,
+        });
+    }
+}
+
+/// A hyper executor that routes spawns through dial9 (Dial9TokioHandle)
 /// so HTTP/2 internal tasks get wake event tracking.
 #[derive(Clone)]
 struct TracedExecutor;
@@ -111,12 +166,19 @@ where
             });
 
             let (close_tx, close_rx) = watch::channel(());
+            let handle = Dial9Handle::current();
 
             loop {
                 let (io, remote_addr) = tokio::select! {
                     conn = listener.accept() => conn,
                     _ = signal_tx.closed() => break,
                 };
+
+                let addr_string = format!("{remote_addr:?}");
+                handle.record_event(ConnectionAccepted {
+                    timestamp_ns: clock_monotonic_ns(),
+                    remote_addr: addr_string.clone(),
+                });
 
                 let io = TokioIo::new(io);
 
@@ -133,6 +195,8 @@ where
                 let hyper_service = TowerToHyperService::new(tower_service);
                 let signal_tx = signal_tx.clone();
                 let close_rx = close_rx.clone();
+                let conn_handle = handle.clone();
+                let conn_start = std::time::Instant::now();
 
                 spawn(async move {
                     let builder = Builder::new(TracedExecutor);
@@ -153,6 +217,12 @@ where
                             }
                         }
                     }
+
+                    conn_handle.record_event(ConnectionClosed {
+                        timestamp_ns: clock_monotonic_ns(),
+                        remote_addr: addr_string,
+                        duration_us: conn_start.elapsed().as_micros() as u64,
+                    });
                     drop(close_rx);
                 });
             }
@@ -170,5 +240,5 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    TelemetryHandle::current().spawn(fut);
+    Dial9TokioHandle::current().spawn(fut);
 }

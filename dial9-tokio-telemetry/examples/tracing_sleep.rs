@@ -1,7 +1,7 @@
 //! Demonstrates tracing spans across async sleep boundaries.
 //! Each span is polled multiple times (producing multiple segments in the viewer).
-use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
-use dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer;
+use dial9_tokio_telemetry::telemetry::{DiskWriter, TracedRuntime};
+use dial9_tokio_telemetry::tracing_layer::Dial9TracingLayer;
 use std::time::Duration;
 use tracing_subscriber::prelude::*;
 
@@ -22,13 +22,13 @@ fn main() {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(2).enable_all();
 
-    let writer = RotatingWriter::single_file("tracing_sleep_trace.bin").unwrap();
+    let writer = DiskWriter::single_file("tracing_sleep_trace.bin").unwrap();
     let (runtime, _guard) = TracedRuntime::builder()
         .with_task_tracking(true)
         .build_and_start(builder, writer)
         .unwrap();
 
-    let subscriber = tracing_subscriber::registry().with(Dial9TokioLayer::new());
+    let subscriber = tracing_subscriber::registry().with(Dial9TracingLayer::new());
     tracing::subscriber::set_global_default(subscriber).expect("failed to set subscriber");
 
     runtime.block_on(async {

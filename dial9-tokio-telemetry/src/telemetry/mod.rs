@@ -3,81 +3,47 @@
 //! All public types are re-exported here — use `dial9_tokio_telemetry::telemetry::*`
 //! rather than reaching into sub-modules.
 
-#[cfg(feature = "analysis")]
-pub(crate) mod analysis;
-pub(crate) mod buffer;
-pub(crate) mod collector;
-pub use collector::Batch;
-#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
-pub mod cpu_profile;
-#[cfg(all(feature = "cpu-profiling", not(target_arch = "aarch64")))]
-pub mod cpu_profile {
-    /// Dummy no-op mock for when targeting a `cpu-profiling`-incompatible platform.
-    #[derive(Default, Debug)]
-    pub struct CpuProfilingConfig {
-        _private: ()
-    }
-
-    /// Dummy no-op mock for when targeting a `cpu-profiling`-incompatible platform.
-    #[derive(Default, Debug)]
-    pub struct SchedEventConfig {
-        _private: ()
-    }
-}
+#[cfg(any(test, feature = "analysis"))]
+/// Trace file reading and analysis utilities.
+pub mod analysis;
+/// Decode-side companion structs for built-in trace events.
+#[cfg(any(feature = "analysis", test))]
+pub mod analysis_events;
+pub(crate) use dial9_core::buffer;
+pub(crate) mod custom_events;
 pub(crate) mod events;
 pub(crate) mod format;
+pub(crate) mod process_resource_usage;
 pub(crate) mod recorder;
+#[cfg(feature = "linux-socket")]
+pub(crate) mod socket_accept_queues;
 pub mod task_dump_config;
 pub(crate) mod task_metadata;
-pub(crate) mod writer;
+pub(crate) use dial9_core::writer;
 
 pub use crate::traced::TracedFuture;
-pub use buffer::{Encodable, ThreadLocalEncoder};
-pub use events::{CpuSampleSource, TelemetryEvent, clock_monotonic_ns};
+pub use custom_events::{CustomEventsConfig, CustomEventsContext};
+pub use dial9_core::buffer::{Encodable, ThreadLocalEncoder};
+#[cfg(feature = "memory-profiling")]
+pub use dial9_perf_self_profile::{AllocEvent, FreeEvent};
+#[cfg(feature = "cpu-profiling")]
+pub use dial9_perf_self_profile::{
+    CpuProfiler, CpuProfilingConfig, CpuSampleSource, SchedEventConfig, SchedProfiler,
+};
+pub use events::clock_monotonic_ns;
 pub use format::{
-    AllocEvent, FreeEvent, PollEndEvent, PollStartEvent, TaskSpawnEvent, WakeEventEvent, WorkerId,
-    WorkerParkEvent, WorkerUnparkEvent,
+    PollEndEvent, PollStartEvent, ProcessResourceUsageEvent, TaskSpawnEvent, WakeEventEvent,
+    WorkerId, WorkerParkEvent, WorkerUnparkEvent,
 };
+pub use process_resource_usage::ProcessResourceUsageConfig;
 pub use recorder::{
-    HasTracePath, NoTracePath, PipelineCustom, PipelineS3, PipelineUnset, RuntimeTelemetryHandle,
-    TelemetryCore, TelemetryCoreBuilder, TelemetryGuard, TelemetryHandle, TelemetryRuntimeError,
-    TraceRuntimeCoreBuilder, TracedRuntime, TracedRuntimeBuilder, current_worker_id, spawn,
+    BuildAndStartRuntime, Dial9Handle, Dial9TokioHandle, HasTracePath, NoTracePath, PipelineCustom,
+    PipelineS3, PipelineUnset, TelemetryCore, TelemetryCoreBuilder, TelemetryGuard,
+    TelemetryRuntimeError, TokioHooks, TraceRuntimeCoreBuilder, TracedRuntime,
+    TracedRuntimeBuilder, current_worker_id, spawn,
 };
+#[cfg(feature = "linux-socket")]
+pub use socket_accept_queues::SocketAcceptQueuesConfig;
 pub use task_dump_config::TaskDumpConfig;
 pub use task_metadata::{TaskId, UNKNOWN_TASK_ID};
-pub use writer::{NullWriter, RotatingWriter, TraceWriter};
-
-/// Record a custom event into the trace.
-///
-/// Events are encoded into a thread-local buffer and flushed to disk by the
-/// background flush thread. This function is very cheap (~100–200 ns) and
-/// safe to call on hot paths.
-///
-/// Any type implementing [`dial9_trace_format::TraceEvent`] (typically via
-/// `#[derive(TraceEvent)]`) automatically implements [`Encodable`] and can
-/// be passed directly. For events that need string interning, implement
-/// [`Encodable`] manually.
-///
-/// Does nothing if telemetry is disabled on the handle.
-///
-/// # Example
-///
-/// ```ignore
-/// use dial9_trace_format::TraceEvent;
-/// use dial9_tokio_telemetry::telemetry::{record_event, clock_monotonic_ns};
-///
-/// #[derive(TraceEvent)]
-/// struct HttpRequest {
-///     #[traceevent(timestamp)]
-///     timestamp_ns: u64,
-///     status_code: u32,
-/// }
-///
-/// record_event(
-///     HttpRequest { timestamp_ns: clock_monotonic_ns(), status_code: 200 },
-///     &handle,
-/// );
-/// ```
-pub fn record_event(event: impl Encodable, handle: &TelemetryHandle) {
-    handle.record_encodable_event(&event);
-}
+pub use writer::{Disk, DiskWriter, InMemoryWriter, Memory, SegmentWriter, WriterMode};

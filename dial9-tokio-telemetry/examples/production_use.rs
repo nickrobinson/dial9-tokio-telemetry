@@ -10,14 +10,14 @@
 //!
 //! ### Enabling and disabling
 //!
-//! - Setting [`.enabled(false)`](dial9_tokio_telemetry::Dial9ConfigBuilder::enabled) on the config builder produces a
+//! - Setting [`.enabled(false)`](dial9_tokio_telemetry::DiskConfigBuilder::enabled) on the config builder produces a
 //!   pass-through config: the `#[main]` macro builds a plain, unmodified tokio runtime with zero dial9 overhead.
-//!   [`TelemetryHandle::current()`](dial9_tokio_telemetry::telemetry::TelemetryHandle::current) returns an inert
+//!   [`Dial9TokioHandle::current()`](dial9_tokio_telemetry::telemetry::Dial9TokioHandle::current) returns an inert
 //!   handle, and `handle.spawn` falls through to `tokio::spawn`, so application code does not need branches.
 //! - Alternatively, you can install dial9 but leave recording disabled at runtime via the handle's
-//!   [`disable()`](dial9_tokio_telemetry::telemetry::TelemetryHandle::disable). The runtime hooks are installed
+//!   [`disable()`](dial9_tokio_telemetry::telemetry::Dial9Handle::disable). The runtime hooks are installed
 //!   but all event writes are no-ops behind a relaxed atomic read. This has slightly more overhead than
-//!   [`.enabled(false)`](dial9_tokio_telemetry::Dial9ConfigBuilder::enabled) but lets a background task flip
+//!   [`.enabled(false)`](dial9_tokio_telemetry::DiskConfigBuilder::enabled) but lets a background task flip
 //!   recording on from dynamic configuration later. It is a larger surface area of code, so it is higher risk.
 //!
 //! > Note! dial9 must be created _before_ your async runtime. dial9 relies on installing itself into the runtime
@@ -110,7 +110,7 @@
 //! To get the most use out of dial9, you need application-specific events in your traces to make sense of your data. The best way to do this is to emit some sort
 //! of request id into your dial9 traces. There are a couple of ways to do this:
 //!
-//! 1. Use the `Dial9TokioLayer`, which is a tracing layer that allows dial9 to capture your tracing spans directly. Typically, you will
+//! 1. Use the `Dial9TracingLayer`, which is a tracing layer that allows dial9 to capture your tracing spans directly. Typically, you will
 //!    select a narrow set of top-level spans to track.
 //! 2. Emit an event when your request starts and when your request stops. Because these should _normally_ always be on the same Tokio Task, we can
 //!    correlate post-hoc to figure exactly which polls belonged to which requests.
@@ -124,7 +124,7 @@
 //! | --------------------------------- | ------------------------------- | ------------------------------------------------------------- |
 //! | `DIAL9_ENABLED`                   | `false`                         | Master switch. `true`/`false` only (Rust `bool::from_str`).   |
 //! | `DIAL9_TRACE_DIR`                 | `/tmp/dial9-traces`             | Directory to write rotated trace segments into.               |
-//! | `DIAL9_ROTATION_SECS`             | `60`                            | Wall-clock rotation period in seconds.                        |
+//! | `DIAL9_ROTATION_SECS`             | `60`                            | Rotation period in seconds, measured monotonically from writer start. |
 //! | `DIAL9_MAX_DISK_USAGE_MB`         | `1024`                          | Upper bound on total on-disk bytes (old files evicted).       |
 //! | `DIAL9_S3_BUCKET`                 | unset / empty                   | When set, sealed segments are gzip-uploaded to this bucket.   |
 //! | `DIAL9_SERVICE_NAME`              | binary name                     | Service name used in the S3 key layout (required with S3).    |
@@ -168,7 +168,7 @@ use std::time::Duration;
 use clap::Parser;
 use dial9_tokio_telemetry::Dial9Config;
 use dial9_tokio_telemetry::telemetry::{
-    HasTracePath, PipelineUnset, TelemetryHandle, TracedRuntimeBuilder,
+    Dial9TokioHandle, HasTracePath, PipelineUnset, TracedRuntimeBuilder,
 };
 use metrique::local::{LocalFormat, OutputStyle};
 use metrique::writer::format::FormatExt;
@@ -189,7 +189,7 @@ struct Dial9Opts {
     #[arg(long, env = "DIAL9_TRACE_DIR", default_value = "/tmp/dial9-traces")]
     trace_dir: String,
 
-    /// Wall-clock rotation period in seconds.
+    /// Rotation period in seconds, measured monotonically from writer start.
     #[arg(long, env = "DIAL9_ROTATION_SECS", default_value_t = 60)]
     rotation_secs: u64,
 
@@ -248,7 +248,7 @@ fn configure_runtime_common(
     r = r
         .with_task_tracking(true)
         .with_worker_metrics_sink(metrics_sink);
-    use dial9_tokio_telemetry::telemetry::cpu_profile::{CpuProfilingConfig, SchedEventConfig};
+    use dial9_tokio_telemetry::telemetry::{CpuProfilingConfig, SchedEventConfig};
     if cpu_profile_enabled {
         r = r.with_cpu_profiling(CpuProfilingConfig::default().frequency_hz(cpu_sample_hz));
     }
@@ -273,7 +273,7 @@ fn configure_runtime_common(
 /// validation failure (unwritable `trace_dir`, zero-sized budget, etc.)
 /// logs an error and returns a pass-through config that builds a plain
 /// tokio runtime. In both the disabled and fallback cases,
-/// `TelemetryHandle::current()` returns an inert handle and
+/// `Dial9TokioHandle::current()` returns an inert handle and
 /// `handle.spawn` delegates to `tokio::spawn`, so application code does
 /// not need to branch on whether dial9 is running.
 fn configure_dial9(opts: &Dial9Opts) -> Dial9Config {
@@ -301,8 +301,8 @@ fn configure_dial9(opts: &Dial9Opts) -> Dial9Config {
     let (s3_bucket, s3_service) = (opts.s3_bucket.clone(), opts.service_name.clone());
 
     let cfg = Dial9Config::builder()
+        .on_disk_buffer(base_path)
         .enabled(opts.enabled)
-        .base_path(base_path)
         .max_file_size(max_file_size)
         .max_total_size(max_disk)
         .rotation_period(opts.rotation());
@@ -385,7 +385,7 @@ async fn workload_task(id: usize) {
 
 #[dial9_tokio_telemetry::main(config = my_config)]
 async fn main() {
-    let handle = TelemetryHandle::current();
+    let handle = Dial9TokioHandle::current();
     let tasks: Vec<_> = (0..100).map(|i| handle.spawn(workload_task(i))).collect();
     for task in tasks {
         let _ = task.await;

@@ -57,6 +57,7 @@ process.stderr.write('\n');
 ```
 {
   // ── Metadata ──
+  files: string[],                  // base filenames of analyzed trace files
   workerIds: number[],              // sorted worker thread IDs
   minTs: number,                    // earliest timestamp (ns)
   maxTs: number,                    // latest timestamp (ns)
@@ -91,8 +92,8 @@ process.stderr.write('\n');
   schedDelayHist: Histogram|null,    // Node.js perf_hooks Histogram of all delay values (ns), null if no delays
 
   // ── Long polls ──
-  longPolls: [{dur, poll, worker}], // polls > 1ms, top 100 sorted by duration descending
-                                    // poll: {start, end, taskId, spawnLoc}
+  longPolls: [{dur, poll, worker, file}], // polls > 1ms, top 100 sorted by duration descending
+                                    // poll: {start, end, taskId, spawnLoc}; file: source trace filename
 
   // ── Queue depth ──
   queueDepthStats: {
@@ -112,11 +113,38 @@ process.stderr.write('\n');
   // ── CPU profiling ──
   callframeSymbols: Map<address, {symbol, location}|[{symbol, location}]>, // address → resolved symbol (array for inlined frames)
   cpuGroups: [{count, leaf, leafRaw, frames}],       // on-CPU sample groups, sorted by count descending
-  schedGroups: [{count, leaf, leafRaw, frames}],     // off-CPU sample groups, sorted by count descending
+  schedGroups: [{count, leaf, leafRaw, frames}],     // off-CPU sample groups (all), sorted by count descending
+
+  // ── Off-CPU split: real blocking vs idle parking ──
+  // An off-CPU sample inside a poll = a task blocked mid-poll (real blocking);
+  // between polls = a worker parked with no work (idle, though itself a futex/condvar wait).
+  // Caveat: an async lock wait (lock().await) ends the poll, so it counts as idle, not in-poll.
+  inPollGroups: [{count, leaf, leafRaw, frames}],    // in-poll (real blocking) sample groups, sorted by count descending
+  offCpuInPollCount: number,        // off-CPU samples taken inside a poll (real blocking)
+  offCpuIdleCount: number,          // off-CPU samples taken between polls (idle parking)
+  inPollByLoc: [{loc, count}],      // in-poll blocking sample count by task spawn location, sorted by count descending
 
   // ── Histograms ──
   spanStats: Map<spanName, Histogram>,      // tracing span duration histograms (ns)
   pollDurationByLoc: Map<spawnLoc, Histogram>,  // poll duration histograms by spawn location (ns)
+
+  // ── Memory profiling ──
+  memory: {                                 // null/undefined if no alloc events in trace
+    topSites: [{callchain, totalBytes, count, estimatedBytes}],  // top 10 allocation sites by estimated bytes
+    leaks: [{callchain, size, timestamp, addr}],                 // allocations with no matching free
+    perTask: Map<taskId, {sampledBytes, count, estimatedBytes}>, // per-task allocation attribution
+    sampleRateBytes: number,                                     // mean bytes between samples (default 524288)
+    summary: {
+      totalAllocBytes: number,              // sum of sampled allocation sizes
+      totalAllocCount: number,              // number of sampled allocations
+      totalFreeCount: number,               // number of matched frees
+      leakedBytes: number,                  // sum of leaked allocation sizes
+      leakedCount: number,                  // allocations with no matching free
+      estimatedTotalBytes: number,          // unbiased estimate of total allocation volume
+      totalDroppedAllocs: number,           // alloc samples lost to ring buffer overflow
+      totalDroppedFrees: number,            // free samples lost to ring buffer overflow (causes false leaks)
+    },
+  },
 }
 ```
 
@@ -192,7 +220,7 @@ const fgData = buildFgData(workerSamples, trace.callframeSymbols);
 
 ## buildSpanData(customEvents)
 
-Pairs `SpanEnter`/`SpanExit` custom events into complete span objects. Requires the `tracing-layer` feature on `dial9-tokio-telemetry` and `Dial9TokioLayer` in the subscriber.
+Pairs `SpanEnter`/`SpanExit` custom events into complete span objects. Requires the `tracing-layer` feature on `dial9-tokio-telemetry` and `Dial9TracingLayer` in the subscriber.
 
 ```javascript
 const { allSpans, spanMeta, maxDepth, childrenByParent } = buildSpanData(trace.customEvents);

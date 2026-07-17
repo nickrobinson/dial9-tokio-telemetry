@@ -2,7 +2,12 @@
 *.bin
 # except the demo trace
 !dial9-viewer/ui/demo-trace.bin
+!dial9-viewer/ui/test-traces/*.bin
 target/
 .agents/skills/
 .claude/
 .zed/
+.progress/
+# Claude Code session transcripts (timestamped agent scratch logs), e.g.
+# 2026-06-28-090321-implement-....txt — never source, keep out of the tree.
+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9]*.txt

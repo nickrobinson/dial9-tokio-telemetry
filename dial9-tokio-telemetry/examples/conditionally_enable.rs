@@ -18,12 +18,12 @@
 use std::time::Duration;
 
 use dial9_tokio_telemetry::Dial9Config;
-use dial9_tokio_telemetry::telemetry::TelemetryHandle;
+use dial9_tokio_telemetry::telemetry::{Dial9Handle, Dial9TokioHandle};
 
 fn my_config() -> Dial9Config {
     Dial9Config::builder()
+        .on_disk_buffer("conditionally_enable_trace.bin")
         .enabled(std::env::var("ENABLE_DIAL9").is_ok())
-        .base_path("conditionally_enable_trace.bin")
         .max_file_size(64 * 1024 * 1024)
         .max_total_size(256 * 1024 * 1024)
         .with_tokio(|t| {
@@ -55,8 +55,8 @@ async fn mixed_task(id: usize) {
 
 #[dial9_tokio_telemetry::main(config = my_config)]
 async fn main() {
-    let handle = TelemetryHandle::current();
-    let telemetry_enabled = handle.is_enabled();
+    let handle = Dial9TokioHandle::current();
+    let telemetry_enabled = Dial9Handle::current().is_enabled();
     println!(
         "Running workload (telemetry {})...",
         if telemetry_enabled {

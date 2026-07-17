@@ -1,6 +1,6 @@
 //! iai-callgrind benchmark for writer-side encoded-batch ingestion.
 //!
-//! Measures `RotatingWriter::write_encoded_batch` on pre-encoded `Batch`
+//! Measures `DiskWriter::write_encoded_batch` on pre-encoded `Batch`
 //! payloads so we can track writer-path regressions separately from encoder
 //! regressions. Uses a temporary file-backed writer (same path as production)
 //! and flushes once per run.
@@ -17,9 +17,10 @@
 #[cfg(not(iai_enabled))]
 fn main() {}
 
+use dial9_core::collector::Batch;
 use dial9_tokio_telemetry::telemetry::{
-    Batch, PollEndEvent, PollStartEvent, RotatingWriter, TaskId, TaskSpawnEvent, TraceWriter,
-    WakeEventEvent, WorkerId, WorkerParkEvent, WorkerUnparkEvent,
+    DiskWriter, PollEndEvent, PollStartEvent, TaskId, TaskSpawnEvent, WakeEventEvent, WorkerId,
+    WorkerParkEvent, WorkerUnparkEvent,
 };
 use dial9_trace_format::encoder::Encoder;
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
@@ -39,7 +40,7 @@ fn make_encoded_batch(worker: usize) -> Batch {
             worker_id: wid,
             local_queue: 5,
             cpu_time_ns: 500_000,
-            sched_wait_ns: 1_000,
+            sched_wait_ns: Some(1_000),
             tid: 0,
         });
 
@@ -94,7 +95,7 @@ fn batches(num_batches: usize) -> Vec<Batch> {
 
 fn write_encoded(batches: Vec<Batch>) -> usize {
     let tmp = TempDir::new().unwrap();
-    let mut writer = RotatingWriter::single_file(tmp.path().join("trace")).unwrap();
+    let mut writer = DiskWriter::single_file(tmp.path().join("trace")).unwrap();
     let mut total_bytes = 0usize;
 
     for batch in &batches {

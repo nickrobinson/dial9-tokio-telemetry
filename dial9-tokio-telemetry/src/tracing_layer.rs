@@ -5,11 +5,11 @@
 //! # Usage
 //!
 //! ```ignore
-//! use dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer;
+//! use dial9_tokio_telemetry::tracing_layer::Dial9TracingLayer;
 //! use tracing_subscriber::prelude::*;
 //!
 //! tracing_subscriber::registry()
-//!     .with(Dial9TokioLayer::new())
+//!     .with(Dial9TracingLayer::new())
 //!     .init();
 //! ```
 //!
@@ -29,13 +29,13 @@
 //! unaffected while controlling trace volume:
 //!
 //! ```ignore
-//! use dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer;
+//! use dial9_tokio_telemetry::tracing_layer::Dial9TracingLayer;
 //! use tracing_subscriber::prelude::*;
 //!
 //! tracing_subscriber::registry()
 //!     .with(tracing_subscriber::fmt::layer())
 //!     .with(
-//!         Dial9TokioLayer::new().with_filter(
+//!         Dial9TracingLayer::new().with_filter(
 //!             tracing_subscriber::filter::Targets::new()
 //!                 .with_target("my_app", tracing::Level::DEBUG)
 //!                 .with_default(tracing::Level::WARN),
@@ -51,12 +51,12 @@
 //!
 //! Each span enter+exit pair costs roughly **300ns** total (tracing dispatch
 //! plus dial9 encoding), of which **~50-100ns** is the dial9 encoding overhead.
-//! Measured with `NullWriter` on a `current_thread` runtime to isolate
-//! encoding from I/O. This scales linearly with nesting depth and is
+//! Measured with an in-memory writer on a `current_thread` runtime to
+//! isolate encoding from I/O. This scales linearly with nesting depth and is
 //! comparable to the cost of a single poll event, so the layer is suitable
 //! for production use with appropriate span filtering.
 
-use crate::telemetry::{TelemetryHandle, clock_monotonic_ns, current_worker_id};
+use crate::telemetry::{Dial9Handle, clock_monotonic_ns, current_worker_id};
 use dial9_trace_format::TraceEvent;
 use dial9_trace_format::encoder::Schema;
 use dial9_trace_format::schema::FieldDef;
@@ -69,6 +69,7 @@ use tracing::span;
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 #[derive(TraceEvent)]
+#[traceevent(wire_slot)]
 struct SpanCloseEvent {
     #[traceevent(timestamp)]
     timestamp_ns: u64,
@@ -189,24 +190,24 @@ impl FieldVisitor<'_> {
 /// # Setup
 ///
 /// ```ignore
-/// use dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer;
+/// use dial9_tokio_telemetry::tracing_layer::Dial9TracingLayer;
 /// use tracing_subscriber::prelude::*;
 ///
 /// tracing_subscriber::registry()
-///     .with(Dial9TokioLayer::new())
+///     .with(Dial9TracingLayer::new())
 ///     .init();
 /// ```
-pub struct Dial9TokioLayer {
+pub struct Dial9TracingLayer {
     schemas: Mutex<HashMap<Identifier, CallsiteSchemas>>,
 }
 
-impl fmt::Debug for Dial9TokioLayer {
+impl fmt::Debug for Dial9TracingLayer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Dial9TokioLayer").finish_non_exhaustive()
+        f.debug_struct("Dial9TracingLayer").finish_non_exhaustive()
     }
 }
 
-impl Dial9TokioLayer {
+impl Dial9TracingLayer {
     /// Create a new layer.
     pub fn new() -> Self {
         Self {
@@ -224,7 +225,7 @@ impl Dial9TokioLayer {
     }
 }
 
-impl Default for Dial9TokioLayer {
+impl Default for Dial9TracingLayer {
     fn default() -> Self {
         Self::new()
     }
@@ -238,12 +239,12 @@ fn field_value<'a>(fields: &'a [(&str, String)], name: &str) -> Option<&'a str> 
         .map(|(_, v)| v.as_str())
 }
 
-impl<S> Layer<S> for Dial9TokioLayer
+impl<S> Layer<S> for Dial9TracingLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        if !TelemetryHandle::current().is_enabled() {
+        if !Dial9Handle::current().is_enabled() {
             return;
         }
         let mut field_values = Vec::new();
@@ -263,7 +264,7 @@ where
     }
 
     fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
-        if !TelemetryHandle::current().is_enabled() {
+        if !Dial9Handle::current().is_enabled() {
             return;
         }
         if let Some(span) = ctx.span(id) {
@@ -277,7 +278,7 @@ where
     }
 
     fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
-        let handle = TelemetryHandle::current();
+        let handle = Dial9Handle::current();
         if !handle.is_enabled() {
             return;
         }
@@ -323,7 +324,7 @@ where
     }
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
-        let handle = TelemetryHandle::current();
+        let handle = Dial9Handle::current();
         if !handle.is_enabled() {
             return;
         }
@@ -357,11 +358,11 @@ where
     }
 
     fn on_close(&self, id: span::Id, _ctx: Context<'_, S>) {
-        let Some(handle) = TelemetryHandle::try_current() else {
+        let Some(handle) = Dial9Handle::try_current() else {
             return;
         };
 
-        handle.record_encodable_event(&SpanCloseEvent {
+        handle.record_event(SpanCloseEvent {
             timestamp_ns: clock_monotonic_ns(),
             span_id: id.into_u64(),
         });

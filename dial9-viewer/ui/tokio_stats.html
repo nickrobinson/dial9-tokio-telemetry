@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tokio Stats</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #e0e0e0; padding: 20px; }
+  h1 { margin-bottom: 12px; font-size: 1.4em; }
+  .periods { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .period-row { display: flex; gap: 8px; align-items: center; padding: 8px 10px; background: #161b22; border-radius: 6px; flex-wrap: wrap; }
+  .period-row label { font-size: 0.85em; }
+  .period-row input { background: #1a1a2e; color: #e0e0e0; border: 1px solid #444; padding: 4px 10px; border-radius: 3px; }
+  .period-row .tag { font-weight: 700; font-size: 0.85em; padding: 2px 8px; border-radius: 3px; margin-right: 4px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  .toolbar button { cursor: pointer; font-weight: 600; background: #6c63ff; color: #fff; border: none; padding: 4px 14px; border-radius: 3px; }
+  .toolbar button.secondary { background: #2a2a4a; color: #e0e0e0; border: 1px solid #444; }
+  .threshold-row { display: flex; align-items: center; gap: 8px; }
+  .threshold-row input[type=range] { width: 180px; }
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .card { background: #161b22; border-radius: 6px; padding: 14px; text-align: center; }
+  .card .value { font-size: 1.6em; font-weight: 700; }
+  .card .label { font-size: 0.75em; color: #8b949e; margin-top: 4px; }
+  .card.bad .value { color: #f85149; }
+  .card.warn .value { color: #d29922; }
+  .card.good .value { color: #3fb950; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #21262d; }
+  th { background: #161b22; color: #8b949e; font-weight: 600; position: sticky; top: 0; }
+  tr:hover { background: #1c2128; }
+  .off-cpu { color: #f85149; font-weight: 600; }
+  .on-cpu { color: #d29922; }
+  .status { margin: 10px 0; font-size: 0.9em; color: #8b949e; }
+  .error { color: #f85149; }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .delta-bad { color: #f85149; }
+  .delta-good { color: #3fb950; }
+  .delta-neutral { color: #8b949e; }
+  .view-tab { display: inline-block; padding: 6px 16px; cursor: pointer; border-radius: 4px 4px 0 0; font-size: 0.85em; font-weight: 600; background: #161b22; color: #8b949e; border: 1px solid #21262d; border-bottom: none; margin-right: 2px; }
+  .view-tab.active { background: #0d1117; color: #e0e0e0; border-color: #444; }
+</style>
+</head>
+<body>
+<script src="creds.js"></script>
+<script src="format.js"></script>
+<script src="flamegraph_diff.js"></script>
+<script src="sse.js"></script>
+<script src="flamegraph_api.js"></script>
+<script src="tokio_stats_api.js"></script>
+<h1>⚡ Tokio Stats</h1>
+<div id="periods" class="periods"></div>
+<div class="toolbar">
+  <button id="btn-add" class="secondary">+ Add period</button>
+  <button id="btn-load">Load</button>
+  <button id="btn-more" class="secondary" style="display:none">Load more</button>
+  <div class="threshold-row">
+    <label>Threshold:</label>
+    <input id="threshold-slider" type="range" min="-1" max="3" step="0.1" value="0">
+    <span id="threshold-label">1ms</span>
+  </div>
+  <label style="font-size:0.85em"><input type="checkbox" id="utc-toggle" checked> UTC</label>
+</div>
+<div id="status" class="status"></div>
+<div id="view-tabs" style="display:none;margin-bottom:12px"></div>
+<div id="summary" class="summary" style="display:none"></div>
+<div id="table-container" style="max-height:70vh;overflow-y:auto"></div>
+
+<script>
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  const COLORS = ["#58a6ff", "#d2a8ff", "#7ee787", "#ffa657"];
+
+  // A shared link pins the bucket's region (`aws_region`). Fold it into the
+  // credentials store so every /api/tokio-stats request carries the
+  // x-dial9-aws-region header — same seam the home page uses on load. Region is
+  // a property of the bucket, not a secret; without it a cross-region bucket is
+  // signed for the server's default region and the listing comes back empty.
+  // No-op when no creds are stored (region is header-only).
+  const urlRegion = params.get("aws_region");
+  if (urlRegion && window.Dial9Creds) {
+    const stored = Dial9Creds.get();
+    if (stored && stored.region !== urlRegion) Dial9Creds.setRegion(urlRegion);
+  }
+
+  // Periods: each has {id, startNs, endNs, data (cached response), scope?, label?}.
+  // `scope` (a URLSearchParams) is set only in diff mode, where each side (A/B)
+  // is a fully independent aggregate scope — bucket/prefix/service/host may all
+  // differ between sides. In the normal (single-scope) mode `scope` is absent
+  // and every period shares the top-level `params` scope, varying only in time.
+  let periods = [];
+  let periodIdCounter = 0;
+
+  // Diff mode: two independent scopes encoded by the shared FlamegraphDiff
+  // scope-link codec (?diff=1&a=<b64>&b=<b64>), the SAME encoding flamegraph.html
+  // consumes. Seeded from the landing page's "Add to diff" tray.
+  const diffParsed = (typeof FlamegraphDiff !== "undefined") ? FlamegraphDiff.parseDiff(params) : null;
+  const diffMode = !!diffParsed;
+
+  // `max_files` ceiling override, raised by the "Load more" button. null lets
+  // the backend pick its own (default) sampling cap. Seeded from the URL so a
+  // deep-sampled view is shareable / survives reload.
+  let maxFiles = params.get("max_files") ? Number(params.get("max_files")) : null;
+  let loading = false;
+
+  // Per-period label ("A"/"B" in diff mode, "P1"/"P2"… otherwise), used by the
+  // summary cards and diff tables.
+  function periodLabel(i) {
+    if (diffMode) return i === 0 ? "A" : "B";
+    return "P" + (i + 1);
+  }
+
+  // One-line human summary of a period's scope (service · host(s) · bucket), for
+  // the diff-mode period rows. Time is shown by the editable pickers already.
+  function scopeSummary(scope) {
+    if (!scope) return "";
+    const bits = [];
+    const svc = scope.get("service");
+    if (svc) bits.push(svc);
+    const hosts = scope.getAll("host");
+    if (hosts.length === 1) bits.push(hosts[0]);
+    else if (hosts.length > 1) bits.push(hosts.length + " hosts");
+    const bkt = scope.get("bucket");
+    if (bkt) bits.push(bkt);
+    return bits.join(" · ");
+  }
+
+  // The scope actually sent for a period: in diff mode its own captured scope
+  // (bucket/prefix/service/host) with the editable time window applied; in
+  // normal mode the shared top-level params with the period's time window.
+  function effectiveScope(period) {
+    const out = new URLSearchParams();
+    const src = period.scope || params;
+    // `aws_region` rides alongside the bucket so a cross-region bucket signs the
+    // right S3 endpoint (also folded into the creds header below; naming it here
+    // keeps the request self-describing and per-side correct in diff mode).
+    for (const k of ["bucket", "aws_region", "prefix", "service"]) {
+      const v = src.get(k);
+      if (v) out.set(k, v);
+    }
+    for (const h of src.getAll("host")) out.append("host", h);
+    if (period.startNs) out.set("start_ns", period.startNs);
+    if (period.endNs) out.set("end_ns", period.endNs);
+    return out;
+  }
+
+  function isUtc() { return document.getElementById("utc-toggle").checked; }
+
+  function nsToDatetime(ns) {
+    if (!ns) return "";
+    const d = new Date(Number(ns) / 1e6);
+    if (isUtc()) return d.toISOString().slice(0, 19);
+    return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  }
+  function datetimeToNs(val) {
+    if (!val) return null;
+    const ms = isUtc() ? new Date(val + "Z").getTime() : new Date(val).getTime();
+    return String(Math.floor(ms * 1e6));
+  }
+  function formatDuration(ns) {
+    if (ns >= 1e9) return (ns / 1e9).toFixed(2) + "s";
+    if (ns >= 1e6) return (ns / 1e6).toFixed(2) + "ms";
+    if (ns >= 1e3) return (ns / 1e3).toFixed(0) + "µs";
+    return ns + "ns";
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function addPeriod(startNs, endNs, scope) {
+    const id = periodIdCounter++;
+    periods.push({ id, startNs: startNs || null, endNs: endNs || null, data: null, scope: scope || null });
+    renderPeriods();
+    syncUrl();
+  }
+
+  function removePeriod(id) {
+    periods = periods.filter(p => p.id !== id);
+    renderPeriods();
+    syncUrl();
+    renderFromCache();
+  }
+
+  function renderPeriods() {
+    const container = document.getElementById("periods");
+    // In diff mode the sides come from independent captured scopes, so a period
+    // row also shows that side's scope summary and its time window is
+    // independently editable. The +Add period / ✕ remove affordances are hidden
+    // (diff mode is exactly two fixed sides, A vs B).
+    container.innerHTML = periods.map((p, i) => {
+      const scopeBit = diffMode && p.scope
+        ? `<span style="color:#8b949e;font-size:0.8em;margin-left:4px">${escapeHtml(scopeSummary(p.scope))}</span>`
+        : "";
+      const removeBtn = (!diffMode && periods.length > 1)
+        ? `<button class="secondary" onclick="removePeriod(${p.id})" style="padding:2px 8px;font-size:0.8em">✕</button>`
+        : "";
+      return `
+      <div class="period-row">
+        <span class="tag" style="background:${COLORS[i % COLORS.length]}33;color:${COLORS[i % COLORS.length]}">${periodLabel(i)}</span>
+        ${scopeBit}
+        <label>From: <input type="datetime-local" step="1" value="${nsToDatetime(p.startNs)}" onchange="updatePeriod(${p.id},'start',this.value)"></label>
+        <label>To: <input type="datetime-local" step="1" value="${nsToDatetime(p.endNs)}" onchange="updatePeriod(${p.id},'end',this.value)"></label>
+        ${removeBtn}
+      </div>`;
+    }).join("");
+  }
+  window.updatePeriod = function(id, field, val) {
+    const p = periods.find(x => x.id === id);
+    if (p) {
+      const ns = datetimeToNs(val);
+      if (field === "start") p.startNs = ns; else p.endNs = ns;
+    }
+    syncUrl();
+  };
+  window.removePeriod = removePeriod;
+
+  // Initialize periods.
+  if (diffMode) {
+    // Diff mode: exactly two sides (A, B), each its own independent scope. The
+    // time window seeds from each scope's start_ns/end_ns but stays editable.
+    addPeriod(diffParsed.a.get("start_ns"), diffParsed.a.get("end_ns"), diffParsed.a);
+    addPeriod(diffParsed.b.get("start_ns"), diffParsed.b.get("end_ns"), diffParsed.b);
+  } else {
+    // Normal mode — supports multiple periods via p1_start_ns/p1_end_ns,
+    // p2_start_ns/p2_end_ns, …; falls back to start_ns/end_ns for single-period
+    // backward compat.
+    let foundPeriods = false;
+    for (let i = 1; i <= 10; i++) {
+      const s = params.get(`p${i}_start_ns`);
+      const e = params.get(`p${i}_end_ns`);
+      if (s || e) { addPeriod(s, e); foundPeriods = true; }
+    }
+    if (!foundPeriods) addPeriod(params.get("start_ns"), params.get("end_ns"));
+  }
+
+  function syncUrl() {
+    // Diff mode's URL is the immutable a=/b= scope-link codec; only the editable
+    // time windows change, and they live inside those encoded scopes, so we
+    // re-encode both sides rather than rewriting to the p{N}_ form.
+    if (diffMode) {
+      const a = new URLSearchParams(diffParsed.a.toString());
+      const b = new URLSearchParams(diffParsed.b.toString());
+      const applyTime = (u, p) => {
+        u.delete("start_ns"); u.delete("end_ns");
+        if (p.startNs) u.set("start_ns", p.startNs);
+        if (p.endNs) u.set("end_ns", p.endNs);
+      };
+      if (periods[0]) applyTime(a, periods[0]);
+      if (periods[1]) applyTime(b, periods[1]);
+      history.replaceState(null, "", "?" + FlamegraphDiff.diffSearch(a, b));
+      return;
+    }
+    const u = new URLSearchParams();
+    for (const k of ["bucket", "aws_region", "prefix", "service"]) { if (params.get(k)) u.set(k, params.get(k)); }
+    for (const h of params.getAll("host")) u.append("host", h);
+    periods.forEach((p, i) => {
+      if (p.startNs) u.set(`p${i+1}_start_ns`, p.startNs);
+      if (p.endNs) u.set(`p${i+1}_end_ns`, p.endNs);
+    });
+    if (maxFiles != null) u.set("max_files", String(maxFiles));
+    history.replaceState(null, "", "?" + u.toString());
+  }
+
+  // Threshold slider
+  const slider = document.getElementById("threshold-slider");
+  const threshLabel = document.getElementById("threshold-label");
+  function thresholdNs() { return Math.pow(10, parseFloat(slider.value)) * 1e6; }
+  function updateThreshLabel() { threshLabel.textContent = formatDuration(thresholdNs()); }
+  slider.addEventListener("input", () => { updateThreshLabel(); renderFromCache(); });
+  updateThreshLabel();
+
+  function exemplarLink(ex, data) {
+    if (!ex || !ex.start_ns) return "";
+    // Forward the poll's window as a NON-DESTRUCTIVE focus (focus_*), not the
+    // start/end parse filter — see exemplarViewerUrl. worker_id/task_id are
+    // present on long-poll rows (they refine the framing + highlight the task)
+    // and absent on spawn-loc exemplars, where focus_start alone still pans the
+    // view to the poll.
+    return exemplarViewerUrl({
+      bucket: (data && data.bucket) || params.get("bucket") || "",
+      sourceKey: ex.source_key,
+      svc: params.get("service") || undefined,
+      host: ex.host || undefined,
+      focusStartNs: ex.start_ns,
+      focusEndNs: ex.end_ns,
+      focusWorker: ex.worker_id,
+      focusTask: ex.task_id,
+    });
+  }
+
+  function computeStats(data, threshNs) {
+    if (!data) return null;
+    const timeMinutes = data.time_span_ns / 60e9;
+    let totalLong = 0, totalOffCpu = 0, totalOnCpu = 0;
+    const byLoc = {};
+    for (const loc of data.by_spawn_loc) {
+      let long = 0, offCpu = 0, onCpu = 0, mixed = 0;
+      for (let i = 0; i < loc.durations_ns.length; i++) {
+        if (loc.durations_ns[i] >= threshNs) {
+          long++;
+          const c = loc.classes[i];
+          if (c === 0) offCpu++;
+          else if (c === 1) onCpu++;
+          else if (c === 2) mixed++;
+          // c === 3 is "unknown" (too short to classify) — counted in long but not bucketed
+        }
+      }
+      totalLong += long; totalOffCpu += offCpu; totalOnCpu += onCpu;
+      const above = loc.durations_ns.filter(d => d >= threshNs);
+      const n = above.length;
+      byLoc[loc.spawn_loc] = {
+        long, offCpu, onCpu, mixed,
+        rate: timeMinutes > 0 ? long / timeMinutes : 0,
+        p50: n > 0 ? above[Math.floor(n * 0.5)] : 0,
+        p99: n > 0 ? above[Math.floor(n * 0.01)] : 0,
+        max: n > 0 ? above[0] : 0,
+        exemplars: loc.exemplars, // [off_cpu, on_cpu, mixed, unknown]
+      };
+    }
+    return { totalLong, totalOffCpu, totalOnCpu, timeMinutes, byLoc,
+             rate: timeMinutes > 0 ? totalLong / timeMinutes : 0, total_polls: data.total_polls };
+  }
+
+  let activeTab = "diff"; // "diff" or "p0", "p1", ...
+
+  function renderTabs() {
+    const tabsEl = document.getElementById("view-tabs");
+    const stats = periods.map(p => computeStats(p.data, thresholdNs()));
+    const loaded = stats.filter(s => s).length;
+    if (loaded <= 1) { tabsEl.style.display = "none"; return; }
+    tabsEl.style.display = "";
+    const tabs = [{id: "diff", label: "⚡ Diff"}];
+    periods.forEach((p, i) => { if (stats[i]) tabs.push({id: `p${i}`, label: `${periodLabel(i)} Detail`}); });
+    tabsEl.innerHTML = tabs.map(t =>
+      `<span class="view-tab ${t.id === activeTab ? 'active' : ''}" onclick="setTab('${t.id}')">${t.label}</span>`
+    ).join("");
+  }
+  window.setTab = function(tab) { activeTab = tab; renderFromCache(); };
+
+  function renderFromCache() {
+    const threshNs = thresholdNs();
+    const stats = periods.map(p => computeStats(p.data, threshNs));
+    if (stats.every(s => !s)) return;
+
+    const sumEl = document.getElementById("summary");
+    const tableEl = document.getElementById("table-container");
+    sumEl.style.display = "";
+    renderTabs();
+
+    const multi = periods.length > 1 && stats.filter(s => s).length > 1;
+
+    // If viewing a specific period's detail, render single-period view.
+    if (multi && activeTab.startsWith("p")) {
+      const idx = parseInt(activeTab.slice(1));
+      const s = stats[idx];
+      const data = periods[idx].data;
+      if (!s) { tableEl.innerHTML = "<p>Not loaded yet.</p>"; return; }
+      renderSinglePeriod(s, data, threshNs, sumEl, tableEl);
+      return;
+    }
+
+    if (!multi) {
+      const s = stats.find(x => x);
+      const data = periods.find(p => p.data).data;
+      if (!s) return;
+      renderSinglePeriod(s, data, threshNs, sumEl, tableEl);
+      return;
+    }
+
+    // ── Diff view ──
+    renderDiffView(stats, threshNs, sumEl, tableEl);
+  }
+
+  function exLink(exemplar, data) {
+    if (!exemplar) return null;
+    return exemplarLink(exemplar, data);
+  }
+
+  function linkedStat(count, exemplar, data, cls) {
+    if (!count) return "";
+    const url = exLink(exemplar, data);
+    if (url) return `<a href="#" class="${cls}" onclick="openExemplar(this);return false" data-url="${url.replace(/"/g,'&quot;')}">${count}</a>`;
+    return `<span class="${cls}">${count}</span>`;
+  }
+
+  function renderSinglePeriod(s, data, threshNs, sumEl, tableEl) {
+    sumEl.innerHTML = `
+      <div class="card"><div class="value">${s.total_polls.toLocaleString()}</div><div class="label">Total Polls</div></div>
+      <div class="card ${s.totalLong > 0 ? 'warn' : 'good'}"><div class="value">${s.totalLong.toLocaleString()}</div><div class="label">Long (>${formatDuration(threshNs)})</div></div>
+      <div class="card ${s.totalLong > 0 ? 'warn' : 'good'}"><div class="value">${s.rate.toFixed(1)}/min</div><div class="label">Rate</div></div>
+      <div class="card ${s.totalOffCpu > 0 ? 'bad' : 'good'}"><div class="value">${s.totalOffCpu.toLocaleString()}</div><div class="label">Off-CPU (blocked)</div></div>
+      <div class="card on-cpu"><div class="value">${s.totalOnCpu.toLocaleString()}</div><div class="label">On-CPU (compute)</div></div>
+    `;
+    const rows = Object.entries(s.byLoc)
+      .filter(([, v]) => v.long > 0)
+      .sort(([, a], [, b]) => b.rate - a.rate);
+    if (!rows.length) { tableEl.innerHTML = "<p style='margin-top:10px'>No polls exceed the threshold.</p>"; return; }
+    let html = `<table><thead><tr>
+      <th>Spawn Location</th><th>Long</th><th>/min</th>
+      <th>Off-CPU 🔴</th><th>On-CPU 🟡</th>
+      <th>P50</th><th>P99</th><th>Max</th>
+    </tr></thead><tbody>`;
+    for (const [loc, v] of rows) {
+      html += `<tr>
+        <td><code>${escapeHtml(loc)}</code></td>
+        <td>${v.long}</td><td>${v.rate.toFixed(1)}</td>
+        <td>${linkedStat(v.offCpu, v.exemplars && v.exemplars[0], data, "off-cpu")}</td>
+        <td>${linkedStat(v.onCpu, v.exemplars && v.exemplars[1], data, "on-cpu")}</td>
+        <td>${formatDuration(v.p50)}</td><td>${formatDuration(v.p99)}</td><td>${formatDuration(v.max)}</td>
+      </tr>`;
+    }
+    html += "</tbody></table>";
+    html += renderLongPolls(data, threshNs);
+    tableEl.innerHTML = html;
+  }
+
+  // "Longest polls": the single futures that held a worker thread longest in one
+  // poll — long polls starve every other task on that worker. Ported from IRIS's
+  // "Longest polls" card; the server ranks them (top_long_polls), the client
+  // filters by the threshold slider so it stays consistent with the table above.
+  // Each row deep-links its trace segment via the same exemplar path.
+  function renderLongPolls(data, threshNs) {
+    const polls = (data && data.top_long_polls) || [];
+    const rows = polls.filter(p => p.duration_ns >= threshNs).slice(0, 50);
+    if (!rows.length) return "";
+    // host column only earns its space when the scope spans more than one host.
+    const multiHost = new Set(rows.map(p => p.host || "")).size > 1;
+    let html = `<h3 style="margin:20px 0 8px">🕒 Longest polls</h3>
+      <p style="font-size:0.8em;color:#8b949e;margin-bottom:6px">Single polls that held a worker thread longest — long polls starve other tasks on that worker. Click a row to open its trace segment.</p>
+      <table><thead><tr>
+        <th>Duration</th><th>Worker</th><th>Task</th><th>Spawn Location</th>${multiHost ? "<th>Host</th>" : ""}
+      </tr></thead><tbody>`;
+    for (const p of rows) {
+      const url = exemplarLink(p, data); // p carries source_key + host, like an exemplar
+      const durCell = `<span style="color:${latencyHeat(p.duration_ns)};font-weight:600">${formatDuration(p.duration_ns)}</span>`;
+      const cells = `<td>${durCell}</td>
+        <td>w${p.worker_id}</td>
+        <td><code>${p.task_id}</code></td>
+        <td><code>${escapeHtml(p.spawn_loc || "(unknown)")}</code></td>${multiHost ? `<td>${escapeHtml(p.host || "")}</td>` : ""}`;
+      html += url
+        ? `<tr style="cursor:pointer" onclick="openExemplar(this)" data-url="${url.replace(/"/g, "&quot;")}">${cells}</tr>`
+        : `<tr>${cells}</tr>`;
+    }
+    html += "</tbody></table>";
+    return html;
+  }
+
+  function renderDiffView(stats, threshNs, sumEl, tableEl) {
+    const first = stats[0], last = stats[stats.length - 1];
+    const rateDelta = last.rate - first.rate;
+    const ratePct = first.rate > 0 ? ((rateDelta / first.rate) * 100).toFixed(0) : (last.rate > 0 ? "+∞" : "0");
+    const offFirst = first.timeMinutes > 0 ? (first.totalOffCpu / first.timeMinutes) : 0;
+    const offLast = last.timeMinutes > 0 ? (last.totalOffCpu / last.timeMinutes) : 0;
+    const offDelta = offLast - offFirst;
+
+    const arrow = rateDelta > 0 ? "↑" : rateDelta < 0 ? "↓" : "→";
+    const cls = rateDelta > 0.5 ? "bad" : rateDelta < -0.5 ? "good" : "";
+    const offCls = offDelta > 0.1 ? "bad" : offDelta < -0.1 ? "good" : "";
+
+    sumEl.innerHTML = `
+      <div class="card ${cls}"><div class="value">${first.rate.toFixed(1)} ${arrow} ${last.rate.toFixed(1)}/min</div><div class="label">Long poll rate (${ratePct > 0 ? "+" : ""}${ratePct}%)</div></div>
+      <div class="card ${offCls}"><div class="value">${offFirst.toFixed(1)} → ${offLast.toFixed(1)}/min</div><div class="label">Off-CPU rate</div></div>
+      <div class="card"><div class="value">${first.total_polls.toLocaleString()}</div><div class="label">${periodLabel(0)} polls</div></div>
+      <div class="card"><div class="value">${last.total_polls.toLocaleString()}</div><div class="label">${periodLabel(periods.length - 1)} polls</div></div>
+    `;
+
+    const allLocs = new Set();
+    for (const s of stats) { if (s) for (const k of Object.keys(s.byLoc)) allLocs.add(k); }
+
+    const diffs = [...allLocs].map(loc => {
+      const f = first.byLoc[loc];
+      const l = last.byLoc[loc];
+      const fRate = f ? f.rate : 0;
+      const lRate = l ? l.rate : 0;
+      return { loc, fRate, lRate, delta: lRate - fRate, first: f, last: l };
+    }).filter(d => d.fRate > 0 || d.lRate > 0);
+
+    const regressions = diffs.filter(d => d.delta > 0.1).sort((a, b) => b.delta - a.delta);
+    const improvements = diffs.filter(d => d.delta < -0.1).sort((a, b) => a.delta - b.delta);
+    const newOffenders = diffs.filter(d => d.fRate === 0 && d.lRate > 0).sort((a, b) => b.lRate - a.lRate);
+
+    let html = "";
+    if (regressions.length) {
+      html += `<h3 style="margin:16px 0 8px;color:#f85149">⬆ Regressions (${regressions.length})</h3>`;
+      html += diffTable(regressions, "delta-bad");
+    }
+    if (newOffenders.length) {
+      html += `<h3 style="margin:16px 0 8px;color:#f85149">🆕 New offenders (${newOffenders.length})</h3>`;
+      html += diffTable(newOffenders, "delta-bad");
+    }
+    if (improvements.length) {
+      html += `<h3 style="margin:16px 0 8px;color:#3fb950">⬇ Improvements (${improvements.length})</h3>`;
+      html += diffTable(improvements, "delta-good");
+    }
+    if (!regressions.length && !improvements.length && !newOffenders.length) {
+      html = "<p style='margin-top:10px'>No significant changes between periods.</p>";
+    }
+    tableEl.innerHTML = html;
+  }
+
+  function diffTable(rows, cls) {
+    let html = `<table><thead><tr><th>Spawn Location</th><th>${periodLabel(0)} /min</th><th>${periodLabel(periods.length - 1)} /min</th><th>Δ /min</th><th>Δ%</th></tr></thead><tbody>`;
+    for (const d of rows) {
+      const pct = d.fRate > 0 ? ((d.delta / d.fRate) * 100).toFixed(0) : "new";
+      html += `<tr>
+        <td><code>${escapeHtml(d.loc)}</code></td>
+        <td>${d.fRate.toFixed(1)}</td>
+        <td>${d.lRate.toFixed(1)}</td>
+        <td class="${cls}">${d.delta > 0 ? "+" : ""}${d.delta.toFixed(1)}</td>
+        <td class="${cls}">${typeof pct === "string" ? pct : (d.delta > 0 ? "+" : "") + pct + "%"}</td>
+      </tr>`;
+    }
+    html += "</tbody></table>";
+    return html;
+  }
+
+  // Render the refinement status line from each period's coverage block, plus
+  // a per-period "refining\u2026" marker while its stream is still folding.
+  function renderStatus(prefix) {
+    const statusEl = document.getElementById("status");
+    statusEl.className = "status";
+    const parts = [];
+    periods.forEach((p, i) => {
+      if (!p.data) return;
+      const badge = formatTokioCoverage(p.data.coverage, p.data.total_polls);
+      if (!badge) return;
+      const label = periods.length > 1 ? `P${i + 1}: ` : "";
+      parts.push(label + badge + (p.refining ? " \u00b7 refining\u2026" : ""));
+    });
+    const head = prefix ? prefix : "";
+    statusEl.textContent = [head, ...parts].filter(Boolean).join(periods.length > 1 ? "  |  " : " \u00b7 ");
+    updateMoreButton();
+  }
+
+  // Show "Load more" only when idle and at least one loaded period still has
+  // matched files left to fold beyond the current sampling cap.
+  function updateMoreButton() {
+    const btn = document.getElementById("btn-more");
+    const canMore = !loading && periods.some(p => p.data && canRefineMore(p.data.coverage));
+    btn.style.display = canMore ? "" : "none";
+  }
+
+  // Stream cancellation: each loadAll() run gets a monotonic token + an
+  // AbortController. A new run (Load / Load more clicked again) aborts the
+  // prior run's in-flight SSE streams and its callbacks bail via the token
+  // guard — otherwise a superseded stream's events could overwrite the current
+  // render, and its server-side folding would keep running (holding fold
+  // permits) until the cap.
+  let loadToken = 0;
+  let loadAbort = null;
+
+  // Load one period over the SSE stream. The server emits the already-folded
+  // snapshot first, then a fresh full snapshot per newly-folded file, and closes
+  // at the sampling cap (raised by "Load more" via max_files). We re-render from
+  // cache on every event. Resolves when the stream closes (or is aborted);
+  // rejects only on a genuine error.
+  function loadPeriod(period, token, signal) {
+    const u = new URL("/api/tokio-stats", window.location.origin);
+    // effectiveScope resolves the right scope per side: in diff mode each
+    // period carries its own independent bucket/prefix/service/host scope; in
+    // normal mode it falls back to the shared top-level params. It also folds
+    // in the (editable) time window, so we just copy its keys onto the URL.
+    for (const [k, v] of effectiveScope(period)) u.searchParams.append(k, v);
+    // "Load more" raises the sampling-cap ceiling for the whole load (shared
+    // across periods), so append it on top of the per-period scope.
+    if (maxFiles != null) u.searchParams.set("max_files", String(maxFiles));
+
+    period.refining = true;
+    const credHeaders = window.Dial9Creds ? Dial9Creds.headers() : {};
+    return new Promise((resolve, reject) => {
+      Dial9Sse.openSse(u, {
+        headers: credHeaders,
+        signal,
+        onEvent: (data) => {
+          if (token !== loadToken) return; // superseded by a newer load
+          period.data = data;
+          renderFromCache();
+          renderStatus("");
+        },
+        onClose: () => {
+          period.refining = false;
+          if (token === loadToken) renderStatus("");
+          resolve();
+        },
+        onError: (err) => {
+          period.refining = false;
+          reject(err);
+        },
+        // openSse calls NEITHER onClose nor onError when aborted, so settle via
+        // its returned promise too (it resolves on close, abort, or after
+        // onError) — otherwise every superseded load's Promise.all would hang
+        // forever. Settling twice is a harmless no-op.
+      }).then(resolve);
+    });
+  }
+
+  // Scan loaded periods for a fold-error notice (e.g. unwritable output bucket).
+  // Returns the first non-null notice, or null if every period folded cleanly.
+  function foldErrorAcrossPeriods() {
+    for (const p of periods) {
+      const notice = p.data && foldErrorNotice(p.data.coverage);
+      if (notice) return notice;
+    }
+    return null;
+  }
+
+  async function loadAll() {
+    const statusEl = document.getElementById("status");
+    // Cancel any in-flight load, then start a fresh one under a new token.
+    if (loadAbort) loadAbort.abort();
+    loadAbort = new AbortController();
+    const token = ++loadToken;
+    const signal = loadAbort.signal;
+    loading = true;
+    updateMoreButton();
+    renderStatus("Loading\u2026");
+    try {
+      // Stream all periods in parallel; each resolves when its stream closes.
+      await Promise.all(periods.map((p) => loadPeriod(p, token, signal)));
+      if (token !== loadToken) return; // superseded while awaiting
+      loading = false;
+      // Surface fold failures instead of silent coverage over an empty table.
+      const notice = foldErrorAcrossPeriods();
+      renderStatus(notice || "");
+      if (notice) statusEl.className = "status error";
+    } catch (e) {
+      if (token !== loadToken) return; // superseded; ignore its error
+      loading = false;
+      // One period's stream failed. Abort the siblings still in flight —
+      // otherwise Promise.all has already rejected but their SSE streams stay
+      // open, and per the note above the server keeps folding source files
+      // (holding fold permits) until each hits the cap. Only the next
+      // loadAll() would otherwise cancel them.
+      if (loadAbort) loadAbort.abort();
+      statusEl.textContent = "Error: " + e.message;
+      statusEl.className = "status error";
+    }
+  }
+
+  document.getElementById("utc-toggle").addEventListener("change", renderPeriods);
+  document.getElementById("btn-load").addEventListener("click", () => {
+    // A manual reload drops any "Load more" deepening and returns to the
+    // sampling cap the page was opened with (the URL's max_files, or default).
+    maxFiles = params.get("max_files") ? Number(params.get("max_files")) : null;
+    syncUrl();
+    loadAll();
+  });
+
+  // "Load more": raise the sampling-cap ceiling to ~4x the deepest sample
+  // folded across the loaded periods, then re-run the refinement loop so each
+  // period folds further into its matched set.
+  document.getElementById("btn-more").addEventListener("click", () => {
+    if (loading) return;
+    const folded = periods.reduce(
+      (m, p) => Math.max(m, p.data && p.data.coverage ? Number(p.data.coverage.files_folded) || 0 : 0),
+      0,
+    );
+    maxFiles = nextMaxFiles(folded);
+    syncUrl();
+    loadAll();
+  });
+  document.getElementById("btn-add").addEventListener("click", () => {
+    const last = periods[periods.length - 1];
+    if (last.startNs && last.endNs) {
+      const span = Number(last.endNs) - Number(last.startNs);
+      addPeriod(String(Number(last.startNs) - span), last.startNs);
+    } else {
+      addPeriod(null, null);
+    }
+  });
+
+  window.openExemplar = function(el) { window.open(el.dataset.url, '_blank'); };
+
+  // Diff mode is exactly two fixed sides (A vs B) — hide the add-period control,
+  // pin the title, and auto-load immediately.
+  if (diffMode) {
+    document.getElementById("btn-add").style.display = "none";
+    document.querySelector("h1").textContent = "⚡ Tokio Stats — diff (A vs B)";
+    loadAll();
+  } else if (params.get("start_ns") || params.get("bucket")) {
+    loadAll();
+  }
+})();
+</script>
+</body>
+</html>

@@ -47,6 +47,69 @@ enum Commands {
         /// Dev mode: serve UI files from disk for faster iteration
         #[arg(long)]
         dev: bool,
+
+        /// Local mode: optimize output for running on a workstation rather than
+        /// a deployed host. Logs are rendered human-readable (instead of JSON)
+        /// and per-request metrics use metrique's local format (instead of
+        /// CloudWatch EMF). The default (deployed) emits JSON logs and EMF
+        /// metrics to stdout.
+        #[arg(long)]
+        local: bool,
+
+        /// Enable demand-driven aggregation against the S3 `--bucket`/`--prefix`
+        /// source: the flamegraph button folds raw trace segments on demand and
+        /// progressively refines. (For a local source, use `--agg-source-dir`.)
+        #[arg(long)]
+        agg: bool,
+
+        /// Enable demand-driven aggregation reading raw segments from this local
+        /// directory (the local equivalent of `--agg` over S3).
+        #[arg(long, conflicts_with = "bucket")]
+        agg_source_dir: Option<PathBuf>,
+
+        /// Where the on-demand aggregator writes (and re-reads) its Parquet
+        /// part-files (local). Defaults to `<agg_source_dir>/flamegraph-data`.
+        #[arg(long)]
+        agg_output_dir: Option<PathBuf>,
+
+        /// Output S3 bucket for the aggregator's Parquet part-files. Defaults to
+        /// the source `--bucket`. May target a different bucket/account/region.
+        #[arg(long)]
+        agg_output_bucket: Option<String>,
+
+        /// Output S3 key prefix for the aggregator's Parquet part-files.
+        #[arg(long, default_value = "flamegraph-data")]
+        agg_output_prefix: String,
+
+        /// Raw-trace segment duration (seconds), used to pad the scope time
+        /// filter so boundary files are not dropped.
+        #[arg(long, default_value_t = crate::ingest::aggregate::DEFAULT_SEGMENT_DURATION_SECS)]
+        agg_segment_secs: i64,
+
+        /// Enable the temporary trace-upload feature: lets another site POST a
+        /// trace (`POST /api/upload`) and have the viewer serve it back once.
+        /// Off by default; there is no auth, so only enable on a trusted network.
+        #[arg(long)]
+        enable_upload: bool,
+    },
+    /// Tools for working with agent-generated HTML reports
+    Report {
+        #[command(subcommand)]
+        action: ReportAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReportAction {
+    /// Serve a report folder over HTTP so embedded iframes can fetch
+    /// trace files (browsers block `fetch()` over `file://`).
+    Serve {
+        /// Path to the report folder (containing `report.html` and assets)
+        path: PathBuf,
+
+        /// Port to listen on
+        #[arg(long, default_value = "8000")]
+        port: u16,
     },
 }
 
@@ -121,9 +184,66 @@ pub async fn run() -> anyhow::Result<()> {
             prefix,
             local_dir,
             dev,
+            local,
+            agg,
+            agg_source_dir,
+            agg_output_dir,
+            agg_output_bucket,
+            agg_output_prefix,
+            agg_segment_secs,
+            enable_upload,
         } => {
-            return crate::serve(port, bucket, prefix, local_dir, dev).await;
+            // Logging and per-request metrics are process-global concerns owned
+            // by the binary, not by app assembly (see `crate::build_app`).
+            // `--local` selects human-readable logs + metrique's local metrics
+            // format; the default (deployed) is JSON logs + EMF. Hold the
+            // metrics handle for the life of the server.
+            crate::init_tracing(local);
+            let _metrics = crate::attach_request_metrics(local);
+
+            let app = crate::build_app(crate::ViewerConfig {
+                bucket,
+                prefix,
+                local_dir,
+                dev,
+                agg,
+                agg_source_dir,
+                agg_output_dir,
+                agg_output_bucket,
+                agg_output_prefix,
+                agg_segment_secs,
+                enable_upload,
+            })
+            .await?;
+
+            let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+            tracing::info!(port, "dial9-viewer listening");
+            println!("\n  → http://localhost:{port}\n");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(crate::shutdown_signal())
+                .await?;
+            return Ok(());
         }
+        Commands::Report { action } => match action {
+            ReportAction::Serve { path, port } => {
+                let canon = std::fs::canonicalize(&path).map_err(|e| {
+                    anyhow::anyhow!("report path '{}' not found: {e}", path.display())
+                })?;
+                if !canon.is_dir() {
+                    anyhow::bail!("report path '{}' is not a directory", canon.display());
+                }
+                let app = crate::report_serve_router(&canon);
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+                eprintln!("Serving report from {}", canon.display());
+                let entry = if canon.join("report.html").exists() {
+                    "report.html"
+                } else {
+                    ""
+                };
+                println!("\n  → http://localhost:{port}/{entry}\n");
+                axum::serve(listener, app).await?;
+            }
+        },
     }
     Ok(())
 }

@@ -1,6 +1,8 @@
+use bytes::Bytes;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
 /// Metadata about an object in storage.
@@ -11,9 +13,81 @@ pub struct ObjectInfo {
     pub last_modified: Option<String>,
 }
 
+/// A bounded page of object listings, plus whether the cap was reached.
+///
+/// `truncated` is the signal the old listing path lacked: when a prefix fans
+/// out to more objects than the cap, the listing stops early and the caller
+/// (and ultimately the UI) needs to know data is missing rather than silently
+/// showing a partial result.
+///
+/// This is the return type of [`StorageBackend::list_objects`], so it is
+/// deliberately *not* `#[non_exhaustive]` — out-of-crate backends must be able
+/// to construct it. Adding a field is therefore a breaking change.
+#[derive(Debug, Clone)]
+pub struct ListPage {
+    pub objects: Vec<ObjectInfo>,
+    /// True if the listing stopped at the requested cap and more objects exist
+    /// that were not returned.
+    pub truncated: bool,
+}
+
+/// A handle to an object's bytes that can be streamed to the client as they
+/// arrive, rather than buffered in full first.
+///
+/// This exists to remove the time-to-first-byte (TTFB) stall on `/api/object`:
+/// the old buffered path called `ByteStream::collect()`, which pulled the entire
+/// object out of S3 into a `Vec<u8>` before a single byte could be written to
+/// the browser (measured ~2s TTFB on real traces). With a streamed body, bytes
+/// flow to the browser as S3 delivers them, so the server↔S3 download overlaps
+/// with the browser↔server transfer (and the browser's incremental
+/// gunzip+decode in `fetchTraceStream`).
+///
+/// The chunk error type is [`std::io::Error`] so the stream composes directly
+/// with [`axum::body::Body::from_stream`] (whose error bound is
+/// `Into<BoxError>`).
+///
+/// `#[non_exhaustive]`: adding a field later (e.g. `content_type`) must not be a
+/// breaking change for out-of-crate `StorageBackend` implementors. It is only
+/// ever constructed inside this crate, where struct-literal construction still
+/// works.
+#[non_exhaustive]
+pub struct ObjectStream {
+    /// The object's bytes, chunk by chunk, as they arrive from the backend.
+    pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    /// The object's total size, if known up front (S3 returns `Content-Length`
+    /// on `GetObject`). Forwarded as the response `content-length` header so the
+    /// browser can show real download progress.
+    pub content_length: Option<i64>,
+}
+
 /// Abstraction over trace storage (S3, local FS, etc.)
 pub trait StorageBackend: Send + Sync {
+    /// List the buckets the current credentials can see. Lets the viewer offer
+    /// a bucket picker instead of requiring the user to know the name. Backends
+    /// without a bucket concept (local FS) return an empty list.
+    fn list_buckets(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>>;
+
+    /// List objects under `prefix`, paginating up to `cap` results.
+    ///
+    /// Returns the objects plus whether the listing was truncated at `cap` —
+    /// the signal a caller needs so a partial result is never mistaken for a
+    /// complete one. `/api/browse` fans many prefixes out at a high cap and
+    /// surfaces the flag as a UI warning.
     fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cap: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPage, StorageError>> + Send + '_>>;
+
+    /// List ALL objects under `prefix`, following pagination to exhaustion and
+    /// without the cap that [`list_objects`] applies. Used by the ingest
+    /// pipeline, which must discover every segment in a 24h window.
+    ///
+    /// [`list_objects`]: StorageBackend::list_objects
+    fn list_objects_all(
         &self,
         bucket: &str,
         prefix: &str,
@@ -31,11 +105,77 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, StorageError>> + Send + '_>>;
+
+    /// Put an object. Routes the write through this backend (S3 or local FS),
+    /// so ingest output can target a different bucket/account/region than the
+    /// source.
+    fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>>;
+
+    /// Like [`get_object`](StorageBackend::get_object), but returns the body as a
+    /// stream so the HTTP layer can forward bytes to the client as they arrive
+    /// instead of buffering the whole object first. See [`ObjectStream`] for the
+    /// TTFB rationale.
+    ///
+    /// Setup errors (object not found, auth failure, etc.) surface from the
+    /// returned future *before* any body streams — so the HTTP layer can still
+    /// map them to a 404/401/403 status. Errors encountered mid-stream (after
+    /// the status line and headers have already been sent) arrive as
+    /// `Err(io::Error)` items on the stream and can no longer change the status.
+    ///
+    /// The default implementation buffers via `get_object` and wraps the result
+    /// in a single-chunk stream. This is correct (just not incremental) and is
+    /// the right behavior for backends with no TTFB problem — e.g. local file
+    /// reads — so [`LocalBackend`] and test backends need no override.
+    fn get_object_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ObjectStream, StorageError>> + Send + '_>> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        Box::pin(async move {
+            let data = self.get_object(&bucket, &key).await?;
+            let content_length = Some(data.len() as i64);
+            let stream = futures::stream::once(async move { Ok(Bytes::from(data)) });
+            Ok(ObjectStream {
+                stream: Box::pin(stream),
+                content_length,
+            })
+        })
+    }
 }
 
 #[derive(Debug)]
 pub enum StorageError {
     NotFound(String),
+    /// The credentials were rejected by S3 (bad keys, wrong region, expired
+    /// token, access denied). Kept distinct from [`StorageError::Other`] so the
+    /// HTTP layer can return a generic 401 without echoing the underlying SDK
+    /// message — which can contain the access key id.
+    Unauthorized,
+    /// The AWS account behind the credentials is not signed up for / opted in
+    /// to S3 in this region. Almost always means the request was signed by the
+    /// *wrong* identity (e.g. the server's ambient credentials instead of the
+    /// pasted ones), so the message points the user there.
+    AccountNotSignedUp,
+    /// The bucket lives in a different S3 region than the request was signed
+    /// for (S3 `PermanentRedirect` / HTTP 301), and the correct region could
+    /// not be resolved. Kept distinct from [`StorageError::Other`] so the HTTP
+    /// layer returns a clear, actionable "wrong region" message instead of an
+    /// opaque 500 — this is the failure the viewer's per-bucket region
+    /// auto-detection exists to prevent.
+    WrongRegion,
+    /// The request was malformed by the client — e.g. an S3 `InvalidBucketName`
+    /// for a bucket name that violates the naming rules (bad characters, wrong
+    /// length). Kept distinct from [`StorageError::Other`] so the HTTP layer
+    /// returns a `400` with an actionable message instead of an opaque `500`
+    /// `fault`; the mistake is in the user's input, not the server.
+    BadRequest(String),
     Other(String),
 }
 
@@ -43,12 +183,135 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageError::NotFound(msg) => write!(f, "not found: {msg}"),
+            StorageError::Unauthorized => {
+                write!(
+                    f,
+                    "credentials rejected by S3 (check keys, region, or expiry)"
+                )
+            }
+            StorageError::AccountNotSignedUp => {
+                write!(
+                    f,
+                    "the AWS account used for this request is not signed up for S3 — \
+                     this usually means the request was signed with the wrong identity. \
+                     Make sure you clicked Apply after pasting your credentials."
+                )
+            }
+            StorageError::WrongRegion => {
+                write!(
+                    f,
+                    "this bucket is in a different AWS region than the request was \
+                     signed for. Set the region (or pick the bucket so its region is \
+                     detected automatically) and try again."
+                )
+            }
+            StorageError::BadRequest(msg) => write!(f, "{msg}"),
             StorageError::Other(msg) => write!(f, "{msg}"),
         }
     }
 }
 
 impl std::error::Error for StorageError {}
+
+/// Map an S3 SDK error to a [`StorageError`], collapsing all
+/// authentication/authorization failures to [`StorageError::Unauthorized`] so
+/// the secret, token, and access key id are never reflected to the client.
+///
+/// Uses the structured error code (via `ProvideErrorMetadata`) rather than
+/// string matching, plus the HTTP status as a backstop.
+fn classify_s3_error<E, R>(err: &aws_sdk_s3::error::SdkError<E, R>) -> StorageError
+where
+    E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
+    R: std::fmt::Debug,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    match err.code() {
+        Some(
+            "InvalidAccessKeyId"
+            | "SignatureDoesNotMatch"
+            | "ExpiredToken"
+            | "ExpiredTokenException"
+            | "InvalidToken"
+            | "AccessDenied"
+            | "AccessDeniedException"
+            | "UnrecognizedClientException"
+            | "InvalidClientTokenId"
+            | "AuthorizationHeaderMalformed",
+        ) => StorageError::Unauthorized,
+        // Account-level: the credentials are valid but the account isn't signed
+        // up for S3 in this region — typically the wrong identity signed it.
+        Some("NotSignedUp" | "OptInRequired") => StorageError::AccountNotSignedUp,
+        // Region mismatch: the bucket lives in another region than the client
+        // was built for, so S3 refuses with `PermanentRedirect` (the classic
+        // form) or the generic `Redirect`. Surface a clear message rather than
+        // the opaque "unclassified S3 error" this used to fall through to.
+        Some("PermanentRedirect" | "Redirect") => StorageError::WrongRegion,
+        // Missing bucket/key: the user pointed at something that does not exist
+        // (typo'd bucket name, deleted object). This is a client mistake, so map
+        // it to 404 rather than letting it fall through to the `Other` arm —
+        // which logged an "unclassified S3 error" and returned a 500 `fault`,
+        // polluting the fault metric with user input. The list/prefix paths hit
+        // this via the bucket-level `NoSuchBucket`; `GetObject`'s `NoSuchKey` is
+        // additionally handled at the call site (with the bucket/key in the
+        // message), so plain code matching here is the fallback.
+        Some("NoSuchBucket" | "NoSuchKey" | "NotFound") => {
+            StorageError::NotFound("the specified bucket or object does not exist".to_string())
+        }
+        // Malformed bucket name: the name itself violates S3's naming rules (bad
+        // characters, wrong length), so S3 rejects it with `InvalidBucketName`
+        // (HTTP 400) before it can look anything up. Like `NoSuchBucket` this is
+        // user input, not a server fault — but it's a *bad request*, not a
+        // missing resource, so map it to 400 rather than 404 and don't let it
+        // fall through to the `Other` arm's 500 `fault`.
+        Some("InvalidBucketName") => {
+            StorageError::BadRequest("the bucket name is not valid".to_string())
+        }
+        // Unmapped error: keep the full SDK detail in the server log (it can
+        // embed the access key id, region, and endpoint — server-eyes only) and
+        // hand the client a generic message rather than reflecting it back.
+        _ => {
+            tracing::warn!(
+                error = %aws_sdk_s3::error::DisplayErrorContext(err),
+                "unclassified S3 error"
+            );
+            StorageError::Other("could not complete the S3 request".to_string())
+        }
+    }
+}
+
+/// Optional plumbing for building ephemeral (bring-your-own-credentials) S3
+/// clients. In production this is `None` and clients use the default HTTPS
+/// connector. Tests inject the in-process `s3s` HTTP client plus an endpoint
+/// override so the header → ephemeral-client → fake-S3 path is exercisable.
+///
+/// This is a test seam, not part of the public API surface — it is `pub` only
+/// so integration tests in another crate can construct it.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct EphemeralS3Config {
+    /// Shared HTTP client/connector reused across ephemeral clients.
+    pub http_client: aws_sdk_s3::config::SharedHttpClient,
+    /// Endpoint override (test-only — never wired to user input; that would be
+    /// an SSRF vector).
+    pub endpoint_url: Option<String>,
+    /// Path-style addressing — required by the `s3s` fake, never for real S3.
+    pub force_path_style: bool,
+}
+
+/// Default region used when the user did not supply (and we could not detect)
+/// one. S3 routes bucket operations regardless once the bucket region is known,
+/// but a concrete region is required to build the client.
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// Per-attempt timeout: how long a single HTTP attempt may take before the SDK
+/// gives up on it (and possibly retries).
+const OPERATION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Overall operation timeout: the wall-clock budget for an entire S3 call,
+/// including all retries. Bounds how long a request to a wrong region, a
+/// black-holed endpoint, or unresponsive S3 can hang the viewer's request
+/// handler.
+const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// S3-backed storage using the AWS SDK.
 pub struct S3Backend {
@@ -58,19 +321,150 @@ pub struct S3Backend {
 impl S3Backend {
     pub async fn from_env() -> Self {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        Self {
-            client: aws_sdk_s3::Client::new(&config),
-        }
+        Self::from_client(aws_sdk_s3::Client::new(&config))
     }
 
     /// Create from an existing S3 client (useful for testing with s3s).
     pub fn from_client(client: aws_sdk_s3::Client) -> Self {
         Self { client }
     }
+
+    /// Build an ephemeral backend from user-supplied credentials.
+    ///
+    /// The credentials are passed as a concrete value, which acts as a *static*
+    /// credential provider: it can never fall back to the server's IMDS/env
+    /// identity. That is the core security property of bring-your-own-creds.
+    pub fn from_credentials(
+        credentials: aws_sdk_s3::config::Credentials,
+        region: Option<&str>,
+        ephemeral: &Option<EphemeralS3Config>,
+    ) -> Self {
+        Self::from_client(build_credentialed_client(credentials, region, ephemeral))
+    }
+
+    /// Paginate `ListObjectsV2` under `prefix`, accumulating up to `cap` objects
+    /// and reporting whether more existed beyond the cap. The cap is a backstop
+    /// against a prefix with unbounded fan-out producing an enormous response.
+    async fn list_objects_paginated(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cap: usize,
+    ) -> Result<ListPage, StorageError> {
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+
+        let mut objects = Vec::new();
+        let mut truncated = false;
+        'pages: while let Some(page) = pages.next().await {
+            let page = page.map_err(|e| classify_s3_error(&e))?;
+            for obj in page.contents() {
+                if objects.len() >= cap {
+                    truncated = true;
+                    break 'pages;
+                }
+                if let Some(key) = obj.key() {
+                    objects.push(ObjectInfo {
+                        key: key.to_string(),
+                        size: obj.size().unwrap_or(0),
+                        last_modified: obj.last_modified().map(|t| t.to_string()),
+                    });
+                }
+            }
+        }
+        if truncated {
+            tracing::warn!(
+                bucket = %bucket,
+                prefix = %prefix,
+                cap,
+                "object listing truncated at cap; some objects are not shown"
+            );
+        }
+
+        Ok(ListPage { objects, truncated })
+    }
+}
+
+/// Construct an `aws_sdk_s3::Client` from explicit credentials. Shared by the
+/// ephemeral backend and the `/api/credentials/check` validation handler.
+pub fn build_credentialed_client(
+    credentials: aws_sdk_s3::config::Credentials,
+    region: Option<&str>,
+    ephemeral: &Option<EphemeralS3Config>,
+) -> aws_sdk_s3::Client {
+    let region = region.unwrap_or(DEFAULT_REGION).to_string();
+    let timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        .operation_attempt_timeout(OPERATION_ATTEMPT_TIMEOUT)
+        .operation_timeout(OPERATION_TIMEOUT)
+        .build();
+    let mut cfg = aws_sdk_s3::config::Builder::new()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .credentials_provider(credentials)
+        .timeout_config(timeouts)
+        .region(aws_sdk_s3::config::Region::new(region));
+
+    if let Some(e) = ephemeral {
+        cfg = cfg.http_client(e.http_client.clone());
+        if let Some(url) = &e.endpoint_url {
+            cfg = cfg.endpoint_url(url);
+        }
+        if e.force_path_style {
+            cfg = cfg.force_path_style(true);
+        }
+    }
+
+    aws_sdk_s3::Client::from_conf(cfg.build())
 }
 
 impl StorageBackend for S3Backend {
+    fn list_buckets(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        Box::pin(async move {
+            const MAX_BUCKETS: usize = 200;
+            let mut pages = self.client.list_buckets().into_paginator().send();
+            let mut names = Vec::new();
+            let mut truncated = false;
+            'pages: while let Some(page) = pages.next().await {
+                let page = page.map_err(|e| classify_s3_error(&e))?;
+                for b in page.buckets() {
+                    if let Some(name) = b.name() {
+                        names.push(name.to_string());
+                    }
+                    if names.len() >= MAX_BUCKETS {
+                        truncated = true;
+                        break 'pages;
+                    }
+                }
+            }
+            if truncated {
+                tracing::warn!(
+                    max = MAX_BUCKETS,
+                    "bucket listing truncated at cap; some buckets are not shown"
+                );
+            }
+            names.sort();
+            Ok(names)
+        })
+    }
+
     fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cap: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPage, StorageError>> + Send + '_>> {
+        let bucket = bucket.to_string();
+        let prefix = prefix.to_string();
+        Box::pin(async move { self.list_objects_paginated(&bucket, &prefix, cap).await })
+    }
+
+    fn list_objects_all(
         &self,
         bucket: &str,
         prefix: &str,
@@ -78,7 +472,8 @@ impl StorageBackend for S3Backend {
         let bucket = bucket.to_string();
         let prefix = prefix.to_string();
         Box::pin(async move {
-            const MAX_RESULTS: usize = 1000;
+            // Same pagination loop as `list_objects`, but with NO cap: follow
+            // continuation tokens to exhaustion so ingest sees every object.
             let mut objects = Vec::new();
             let mut continuation: Option<String> = None;
 
@@ -92,10 +487,13 @@ impl StorageBackend for S3Backend {
                     req = req.continuation_token(token);
                 }
 
-                let resp = req.send().await.map_err(|e| {
-                    use aws_sdk_s3::error::DisplayErrorContext;
-                    StorageError::Other(format!("{}", DisplayErrorContext(&e)))
-                })?;
+                // Classify the error like the sibling listing methods do, so an
+                // auth failure surfaces as `Unauthorized` rather than a generic
+                // `Other` that callers can't distinguish from an empty listing.
+                // This is what lets a caller (e.g. a future per-side
+                // bring-your-own-credentials prompt) tell "needs different
+                // credentials" apart from "empty window".
+                let resp = req.send().await.map_err(|e| classify_s3_error(&e))?;
 
                 for obj in resp.contents() {
                     if let Some(key) = obj.key() {
@@ -107,13 +505,23 @@ impl StorageBackend for S3Backend {
                     }
                 }
 
-                if objects.len() >= MAX_RESULTS {
-                    objects.truncate(MAX_RESULTS);
-                    break;
-                }
-
                 if resp.is_truncated() == Some(true) {
-                    continuation = resp.next_continuation_token().map(|s| s.to_string());
+                    match resp.next_continuation_token() {
+                        Some(token) => continuation = Some(token.to_string()),
+                        None => {
+                            // S3 says there's more but gave us no token to fetch
+                            // it. Re-issuing the same request would loop forever,
+                            // so stop here with what we have rather than spin.
+                            tracing::warn!(
+                                bucket = %bucket,
+                                prefix = %prefix,
+                                returned = objects.len(),
+                                "list_objects_all: response truncated but no continuation token; \
+                                 returning partial listing"
+                            );
+                            break;
+                        }
+                    }
                 } else {
                     break;
                 }
@@ -131,24 +539,45 @@ impl StorageBackend for S3Backend {
         let bucket = bucket.to_string();
         let prefix = prefix.to_string();
         Box::pin(async move {
-            let resp = self
+            // Bound the number of child prefixes returned, mirroring the caps on
+            // the other listings, so a directory with an unbounded fan-out can't
+            // produce an enormous response.
+            const MAX_PREFIXES: usize = 1000;
+            // Common prefixes count against MaxKeys per response, so a directory
+            // with more than one page of children must be paginated or it would
+            // silently truncate.
+            let mut pages = self
                 .client
                 .list_objects_v2()
                 .bucket(&bucket)
                 .prefix(&prefix)
                 .delimiter("/")
-                .send()
-                .await
-                .map_err(|e| {
-                    use aws_sdk_s3::error::DisplayErrorContext;
-                    StorageError::Other(format!("{}", DisplayErrorContext(&e)))
-                })?;
+                .into_paginator()
+                .send();
 
-            Ok(resp
-                .common_prefixes()
-                .iter()
-                .filter_map(|cp| cp.prefix().map(|s| s.to_string()))
-                .collect())
+            let mut prefixes = Vec::new();
+            let mut truncated = false;
+            'pages: while let Some(page) = pages.next().await {
+                let page = page.map_err(|e| classify_s3_error(&e))?;
+                for cp in page.common_prefixes() {
+                    if let Some(p) = cp.prefix() {
+                        prefixes.push(p.to_string());
+                    }
+                    if prefixes.len() >= MAX_PREFIXES {
+                        truncated = true;
+                        break 'pages;
+                    }
+                }
+            }
+            if truncated {
+                tracing::warn!(
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    max = MAX_PREFIXES,
+                    "prefix listing truncated at cap; some child prefixes are not shown"
+                );
+            }
+            Ok(prefixes)
         })
     }
 
@@ -160,6 +589,13 @@ impl StorageBackend for S3Backend {
         let bucket = bucket.to_string();
         let key = key.to_string();
         Box::pin(async move {
+            // A single GET per object. Object-level concurrency comes from the
+            // ingest work-queue (N workers each downloading one object), which
+            // benchmarked ~2.4x faster than routing these ~37MB trace segments
+            // through the transfer manager's multipart path (the part split +
+            // reassembly overhead dominated, and a shared transfer-manager
+            // instance throttled all workers to a flat wall time regardless of
+            // worker count).
             let resp = self
                 .client
                 .get_object()
@@ -168,14 +604,17 @@ impl StorageBackend for S3Backend {
                 .send()
                 .await
                 .map_err(|e| {
-                    use aws_sdk_s3::error::DisplayErrorContext;
                     use aws_sdk_s3::operation::get_object::GetObjectError;
 
+                    // Classify before unwrapping the service error so auth
+                    // failures (which arrive as the redirect/4xx service error)
+                    // collapse to Unauthorized rather than leaking the message.
+                    let classified = classify_s3_error(&e);
                     match e.into_service_error() {
                         GetObjectError::NoSuchKey(_) => {
                             StorageError::NotFound(format!("{bucket}/{key}"))
                         }
-                        other => StorageError::Other(format!("{}", DisplayErrorContext(&other))),
+                        _ => classified,
                     }
                 })?;
 
@@ -186,6 +625,87 @@ impl StorageBackend for S3Backend {
                 .map_err(|e| StorageError::Other(e.to_string()))?;
 
             Ok(bytes.to_vec())
+        })
+    }
+
+    fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        Box::pin(async move {
+            self.client
+                .put_object()
+                .bucket(&bucket)
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(data))
+                .send()
+                .await
+                .map_err(|e| {
+                    use aws_sdk_s3::error::DisplayErrorContext;
+                    StorageError::Other(format!("{}", DisplayErrorContext(&e)))
+                })?;
+            Ok(())
+        })
+    }
+
+    /// Stream the object body straight from S3 instead of buffering it. The
+    /// `GetObject` request (and thus NoSuchKey / auth / not-found classification)
+    /// still completes synchronously in the returned future, so the HTTP layer
+    /// gets the right status before any body streams. The body is then handed
+    /// back as a chunk stream — we do NOT call `.collect()`.
+    fn get_object_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<ObjectStream, StorageError>> + Send + '_>> {
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| {
+                    use aws_sdk_s3::operation::get_object::GetObjectError;
+
+                    // Classify before unwrapping the service error so auth
+                    // failures (which arrive as the redirect/4xx service error)
+                    // collapse to Unauthorized rather than leaking the message.
+                    let classified = classify_s3_error(&e);
+                    match e.into_service_error() {
+                        GetObjectError::NoSuchKey(_) => {
+                            StorageError::NotFound(format!("{bucket}/{key}"))
+                        }
+                        _ => classified,
+                    }
+                })?;
+
+            let content_length = resp.content_length();
+
+            // Drive the body via the always-public `ByteStream::next()` (the
+            // `Stream` impl on `ByteStream` itself is feature-gated/private in
+            // this SDK). `unfold` yields one chunk per poll, mapping the SDK
+            // chunk error into `io::Error` so the stream composes with
+            // `Body::from_stream`. No `.collect()` — bytes flow as they arrive.
+            let stream = futures::stream::unfold(resp.body, |mut body| async move {
+                match body.next().await {
+                    Some(Ok(chunk)) => Some((Ok(chunk), body)),
+                    Some(Err(e)) => Some((Err(std::io::Error::other(e)), body)),
+                    None => None,
+                }
+            });
+
+            Ok(ObjectStream {
+                stream: Box::pin(stream),
+                content_length,
+            })
         })
     }
 }
@@ -209,7 +729,41 @@ impl LocalBackend {
 }
 
 impl StorageBackend for LocalBackend {
+    fn list_buckets(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        // Local mode has no bucket concept; the synthetic "local" bucket is
+        // wired in by the caller.
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn list_objects(
+        &self,
+        _bucket: &str,
+        prefix: &str,
+        cap: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPage, StorageError>> + Send + '_>> {
+        let prefix = prefix.to_string();
+        Box::pin(async move {
+            let root = self.root.clone();
+            let prefix2 = prefix.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut objects = Vec::new();
+                // `collect_files` enforces its own local-FS-safety bounds
+                // (`MAX_COLLECT_FILES`); the `cap` is applied on top so the
+                // contract holds for any caller-chosen limit.
+                collect_files(&root, &root, &prefix2, &mut objects, 0, &mut 0)?;
+                objects.sort_by(|a, b| a.key.cmp(&b.key));
+                let truncated = objects.len() > cap;
+                objects.truncate(cap);
+                Ok(ListPage { objects, truncated })
+            })
+            .await
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        })
+    }
+
+    fn list_objects_all(
         &self,
         _bucket: &str,
         prefix: &str,
@@ -217,10 +771,11 @@ impl StorageBackend for LocalBackend {
         let prefix = prefix.to_string();
         Box::pin(async move {
             let root = self.root.clone();
-            let prefix2 = prefix.clone();
             tokio::task::spawn_blocking(move || {
+                // Uncapped recursive walk: ingest needs every segment, unlike
+                // the UI listing which caps via `collect_files`.
                 let mut objects = Vec::new();
-                collect_files(&root, &root, &prefix2, &mut objects, 0, &mut 0)?;
+                collect_files_uncapped(&root, &root, &prefix, &mut objects)?;
                 objects.sort_by(|a, b| a.key.cmp(&b.key));
                 Ok(objects)
             })
@@ -311,6 +866,48 @@ impl StorageBackend for LocalBackend {
             .map_err(|e| StorageError::Other(e.to_string()))?
         })
     }
+
+    fn put_object(
+        &self,
+        _bucket: &str,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        let root = self.root.clone();
+        let key = key.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let path = root.join(&key);
+                // Reject path-traversal keys *before* creating any directories.
+                // `create_dir_all` would otherwise materialize `../` directories
+                // outside the root before the canonicalize check below could
+                // reject the write, leaving stray dirs behind.
+                if path.components().any(|c| c == Component::ParentDir) {
+                    return Err(StorageError::Other(
+                        "key contains path traversal".to_string(),
+                    ));
+                }
+                // Reject keys that escape the root once their parent dirs are
+                // resolved (mirrors the safety check used elsewhere here).
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    let canonical_parent = parent
+                        .canonicalize()
+                        .map_err(|e| StorageError::Other(e.to_string()))?;
+                    if !canonical_parent.starts_with(&root) {
+                        return Err(StorageError::Other(
+                            "path escapes root directory".to_string(),
+                        ));
+                    }
+                }
+                std::fs::write(&path, data).map_err(|e| StorageError::Other(e.to_string()))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageError::Other(e.to_string()))?
+        })
+    }
 }
 
 /// Maximum directory depth to recurse into when listing local files.
@@ -370,6 +967,75 @@ fn collect_files(
                 collect_files(root, &canonical, prefix, out, depth + 1, visited)?;
             }
         } else if canonical.is_file() {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+            if file_name_str.starts_with('.') {
+                continue;
+            }
+            let key = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            if key.starts_with(prefix) {
+                let meta = std::fs::metadata(&canonical)
+                    .map_err(|e| StorageError::Other(e.to_string()))?;
+                out.push(ObjectInfo {
+                    key,
+                    size: meta.len() as i64,
+                    last_modified: meta.modified().ok().and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs().to_string())
+                    }),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect ALL files under `root` whose key starts with `prefix`,
+/// with NO file-count or entries-visited caps. Used by
+/// [`LocalBackend::list_objects_all`] for ingest, which must see the whole tree.
+///
+/// This mirrors S3 `list_objects_all` semantics: it returns *every* matching
+/// object (including the aggregation output `.parquet` files under `samples/`,
+/// `dict/`, and `polls/`), so callers like the folded-set listing
+/// ([`crate::ingest::aggregate::list_folded_leaves`]) see the whole output tree.
+/// Trace-file selection (the `.bin` / `.bin.gz` extension filter) is the
+/// caller's responsibility — the ingest lister applies it. Honors the same
+/// path-escape safety (canonical paths must stay within `root`) and skipped
+/// directories (`.`, `target`, `node_modules`) as [`collect_files`].
+fn collect_files_uncapped(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<ObjectInfo>,
+) -> Result<(), StorageError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(StorageError::Other("permission denied".into()));
+        }
+        Err(e) => return Err(StorageError::Other(e.to_string())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| StorageError::Other(e.to_string()))?;
+        let path = entry.path();
+        // Resolve symlinks and verify the target stays within root.
+        let canonical = match path.canonicalize() {
+            Ok(c) if c.starts_with(root) => c,
+            _ => continue,
+        };
+        if canonical.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !is_skipped_dir(&name) {
+                collect_files_uncapped(root, &canonical, prefix, out)?;
+            }
+        } else if canonical.is_file() {
             let key = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -396,6 +1062,286 @@ fn collect_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an `S3Backend` whose HTTP layer replays the given canned responses
+    /// in order, so multi-page pagination can be tested without a live S3 (the
+    /// `s3s-fs` fake never emits a continuation token, so it can't drive page 2).
+    fn replay_backend(
+        responses: Vec<&str>,
+    ) -> (
+        S3Backend,
+        aws_smithy_http_client::test_util::StaticReplayClient,
+    ) {
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+
+        let events = responses
+            .into_iter()
+            .map(|body| {
+                ReplayEvent::new(
+                    http::Request::builder()
+                        .uri("https://s3.amazonaws.com/")
+                        .body(SdkBody::empty())
+                        .unwrap(),
+                    http::Response::builder()
+                        .status(200)
+                        .body(SdkBody::from(body))
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let http_client = StaticReplayClient::new(events);
+        let cfg = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .http_client(http_client.clone())
+            .build();
+        (
+            S3Backend::from_client(aws_sdk_s3::Client::from_conf(cfg)),
+            http_client,
+        )
+    }
+
+    /// Build an `S3Backend` whose HTTP layer replays a single error response
+    /// (status + body) for the next request, so the error-classification path
+    /// can be exercised without a live S3.
+    fn replay_error_backend(status: u16, body: &str) -> S3Backend {
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+
+        let http_client = StaticReplayClient::new(vec![ReplayEvent::new(
+            http::Request::builder()
+                .uri("https://s3.amazonaws.com/")
+                .body(SdkBody::empty())
+                .unwrap(),
+            http::Response::builder()
+                .status(status)
+                .body(SdkBody::from(body))
+                .unwrap(),
+        )]);
+        let cfg = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .http_client(http_client)
+            .build();
+        S3Backend::from_client(aws_sdk_s3::Client::from_conf(cfg))
+    }
+
+    /// A `PermanentRedirect` (the error S3 returns when a bucket is addressed in
+    /// the wrong region) must classify to [`StorageError::WrongRegion`], not the
+    /// opaque `Other` that produced the "unclassified S3 error" log. This is the
+    /// regression guard for the cross-region bucket bug.
+    #[tokio::test]
+    async fn permanent_redirect_classifies_as_wrong_region() {
+        // The XML S3 sends on a region mismatch (HTTP 301 + PermanentRedirect).
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <Error>
+              <Code>PermanentRedirect</Code>
+              <Message>The bucket you are attempting to access must be addressed using the specified endpoint.</Message>
+              <Endpoint>my-bucket.s3.us-west-2.amazonaws.com</Endpoint>
+            </Error>"#;
+        let backend = replay_error_backend(301, body);
+
+        let err = backend
+            .list_prefixes("my-bucket", "")
+            .await
+            .expect_err("a PermanentRedirect must surface as an error");
+        assert!(
+            matches!(err, StorageError::WrongRegion),
+            "expected WrongRegion, got {err:?}"
+        );
+        // The message points the user at the fix (set/detect the region).
+        assert!(err.to_string().contains("region"), "message: {err}");
+    }
+
+    /// A `NoSuchBucket` (the error S3 returns when the bucket name does not
+    /// exist — typically a user typo) must classify to [`StorageError::NotFound`]
+    /// (→ HTTP 404), not the opaque `Other` that produced an "unclassified S3
+    /// error" log and a 500 `fault`. Guards against user input polluting the
+    /// server-fault metric.
+    #[tokio::test]
+    async fn no_such_bucket_classifies_as_not_found() {
+        // The XML S3 sends when the bucket does not exist (HTTP 404).
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <Error>
+              <Code>NoSuchBucket</Code>
+              <Message>The specified bucket does not exist</Message>
+              <BucketName>test-shanks</BucketName>
+            </Error>"#;
+        let backend = replay_error_backend(404, body);
+
+        let err = backend
+            .list_prefixes("test-shanks", "")
+            .await
+            .expect_err("a NoSuchBucket must surface as an error");
+        assert!(
+            matches!(err, StorageError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// An `InvalidBucketName` (S3's error for a syntactically invalid bucket
+    /// name, HTTP 400) must classify to [`StorageError::BadRequest`] (→ HTTP
+    /// 400), not the opaque `Other` that produced an "unclassified S3 error"
+    /// log and a 500 `fault`. Like `NoSuchBucket` it's user input, but it's a
+    /// malformed request rather than a missing resource.
+    #[tokio::test]
+    async fn invalid_bucket_name_classifies_as_bad_request() {
+        // The XML S3 sends when the bucket name violates the naming rules.
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <Error>
+              <Code>InvalidBucketName</Code>
+              <Message>The specified bucket is not valid.</Message>
+              <BucketName>Not_A_Valid_Bucket</BucketName>
+            </Error>"#;
+        let backend = replay_error_backend(400, body);
+
+        let err = backend
+            .list_prefixes("Not_A_Valid_Bucket", "")
+            .await
+            .expect_err("an InvalidBucketName must surface as an error");
+        assert!(
+            matches!(err, StorageError::BadRequest(_)),
+            "expected BadRequest, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_prefixes_follows_continuation_token() {
+        // Page 1 is truncated and carries a NextContinuationToken; page 2 is the
+        // final page. The fix must follow the token and merge both pages — the
+        // old single-shot code would drop `c/`.
+        let page1 = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+              <Name>bucket</Name><Prefix></Prefix><Delimiter>/</Delimiter>
+              <IsTruncated>true</IsTruncated>
+              <NextContinuationToken>TOKEN_A</NextContinuationToken>
+              <CommonPrefixes><Prefix>a/</Prefix></CommonPrefixes>
+              <CommonPrefixes><Prefix>b/</Prefix></CommonPrefixes>
+            </ListBucketResult>"#;
+        let page2 = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+              <Name>bucket</Name><Prefix></Prefix><Delimiter>/</Delimiter>
+              <IsTruncated>false</IsTruncated>
+              <CommonPrefixes><Prefix>c/</Prefix></CommonPrefixes>
+            </ListBucketResult>"#;
+
+        let (backend, http_client) = replay_backend(vec![page1, page2]);
+        let prefixes = backend.list_prefixes("bucket", "").await.unwrap();
+        assert_eq!(prefixes, vec!["a/", "b/", "c/"]);
+
+        // Two HTTP calls were made, and the second carried the continuation token
+        // from the first — proving pagination actually happened.
+        let requests = http_client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2, "expected two list calls");
+        assert!(
+            requests[1].uri().contains("continuation-token=TOKEN_A"),
+            "second request must carry the continuation token, got: {}",
+            requests[1].uri()
+        );
+    }
+
+    /// A `put_object` key containing `../` must be rejected *before* any
+    /// directories are created — otherwise the traversal materializes dirs
+    /// outside the root that the later canonicalize check never cleans up.
+    #[tokio::test]
+    async fn put_object_rejects_path_traversal_without_creating_dirs() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let backend = LocalBackend::new(&root);
+
+        let err = backend
+            .put_object("bucket", "../escape/evil.bin", b"x".to_vec())
+            .await
+            .expect_err("traversal key must be rejected");
+        match err {
+            StorageError::Other(msg) => {
+                assert!(msg.contains("path traversal"), "unexpected message: {msg}")
+            }
+            other => panic!("expected StorageError::Other, got {other:?}"),
+        }
+
+        // The traversal dir (`<outer>/escape`) must NOT have been created.
+        let escape_dir = outer.path().join("escape");
+        assert!(
+            !escape_dir.exists(),
+            "path traversal created a directory outside the root: {}",
+            escape_dir.display()
+        );
+    }
+
+    /// A normal key writes through `put_object`, creating parent dirs under root.
+    #[tokio::test]
+    async fn put_object_writes_normal_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path());
+
+        backend
+            .put_object("bucket", "a/b/c.bin", b"hi".to_vec())
+            .await
+            .unwrap();
+
+        let written = dir.path().join("a/b/c.bin");
+        assert!(written.exists(), "expected file at {}", written.display());
+        assert_eq!(std::fs::read(&written).unwrap(), b"hi");
+    }
+
+    /// Build a backend that replays a single response with an explicit status
+    /// and body — used to drive the SDK's error path (the success-only
+    /// `replay_backend` always returns 200).
+    fn replay_backend_status(status: u16, body: &str) -> S3Backend {
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+        let events = vec![ReplayEvent::new(
+            http::Request::builder()
+                .uri("https://s3.amazonaws.com/")
+                .body(SdkBody::empty())
+                .unwrap(),
+            http::Response::builder()
+                .status(status)
+                .body(SdkBody::from(body))
+                .unwrap(),
+        )];
+        let http_client = StaticReplayClient::new(events);
+        let cfg = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .http_client(http_client)
+            .build();
+        S3Backend::from_client(aws_sdk_s3::Client::from_conf(cfg))
+    }
+
+    #[tokio::test]
+    async fn list_objects_all_maps_auth_failure_to_unauthorized() {
+        // S3 returns 403 InvalidAccessKeyId when the credentials can't read the
+        // bucket. `list_objects_all` must classify this as `Unauthorized` (not
+        // the generic `Other`), consistent with the sibling listing methods, so
+        // callers can distinguish "needs different credentials" from "empty
+        // window".
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <Error><Code>InvalidAccessKeyId</Code>
+            <Message>The AWS Access Key Id you provided does not exist in our records.</Message>
+            </Error>"#;
+        let backend = replay_backend_status(403, body);
+        let err = backend
+            .list_objects_all("bucket", "prefix")
+            .await
+            .expect_err("auth failure must be an error");
+        assert!(
+            matches!(err, StorageError::Unauthorized),
+            "expected Unauthorized, got {err:?}"
+        );
+    }
 
     #[test]
     fn collect_files_caps_entries_visited() {

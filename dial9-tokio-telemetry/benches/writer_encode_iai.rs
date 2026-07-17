@@ -1,7 +1,7 @@
 //! IAI callgrind micro-benchmark for encoder-only throughput.
 //!
 //! Measures the pure encode path: RawEvent → Encoder → Vec<u8>. No
-//! RotatingWriter, no syscalls — instruction count reflects encoder work
+//! DiskWriter, no syscalls — instruction count reflects encoder work
 //! only. Builds anywhere; only runs on Linux (valgrind dependency).
 //!
 //! Usage:
@@ -43,7 +43,7 @@ fn encode(workers: Vec<usize>) -> Vec<u8> {
                 worker_id: wid,
                 local_queue: 5,
                 cpu_time_ns: 500_000,
-                sched_wait_ns: 1_000,
+                sched_wait_ns: Some(1_000),
                 tid: 0,
             });
 

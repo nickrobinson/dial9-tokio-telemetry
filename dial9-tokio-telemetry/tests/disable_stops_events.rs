@@ -1,13 +1,44 @@
-mod common;
-
-use dial9_tokio_telemetry::telemetry::{RotatingWriter, TelemetryEvent, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::analysis_events::Dial9Event;
+use dial9_tokio_telemetry::telemetry::{DiskWriter, TracedRuntime};
+use dial9_trace_format::decoder::Decoder;
+use std::path::Path;
 use std::time::Duration;
+
+/// Decode every event from all trace segment files in `dir`, including the
+/// live `.active` segment.
+fn read_events_on_disk(dir: &Path) -> Vec<Dial9Event> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().contains(".bin"))
+        .collect();
+    files.sort();
+
+    let mut events = Vec::new();
+    for path in files {
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(mut dec) = Decoder::new(&data) else {
+            continue;
+        };
+        // Ignore a trailing decode error from a partially-written .active tail.
+        let _ = dec.for_each_event(|raw| {
+            if let Ok(ev) = raw.deserialize::<Dial9Event>() {
+                events.push(ev);
+            }
+        });
+    }
+    events
+}
 
 /// After `disable()` is called and in-flight events are drained, no new
 /// events should be produced by subsequent work.
 #[test]
 fn disable_stops_all_event_production() {
-    let (writer, events) = common::CapturingWriter::new();
+    let dir = tempfile::tempdir().unwrap();
+    let trace_path = dir.path().join("trace.bin");
+    let writer = DiskWriter::single_file(&trace_path).unwrap();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(2).enable_all();
@@ -36,10 +67,14 @@ fn disable_stops_all_event_production() {
     handle.disable();
 
     // Wait for the flush thread to drain any in-flight events produced
-    // before disable.
-    std::thread::sleep(Duration::from_millis(200));
+    // before disable. Generous so a slow flush-to-disk doesn't leave a pre-disable
+    // event to land during phase 2 and read as a false "new event".
+    std::thread::sleep(Duration::from_millis(500));
 
-    let count_after_disable = events.lock().unwrap().len();
+    let count_after_disable = read_events_on_disk(dir.path())
+        .iter()
+        .filter(|e| !matches!(e, Dial9Event::Other))
+        .count();
 
     // Phase 2: produce more work while disabled
     runtime.block_on(async {
@@ -59,7 +94,10 @@ fn disable_stops_all_event_production() {
     // Give the flush thread plenty of time to pick up any leaked events.
     std::thread::sleep(Duration::from_millis(500));
 
-    let count_after_phase2 = events.lock().unwrap().len();
+    let count_after_phase2 = read_events_on_disk(dir.path())
+        .iter()
+        .filter(|e| !matches!(e, Dial9Event::Other))
+        .count();
 
     assert_eq!(
         count_after_disable,
@@ -80,9 +118,11 @@ fn disable_stops_all_event_production() {
 #[test]
 #[cfg(all(feature = "cpu-profiling", target_os = "linux"))]
 fn disable_stops_cpu_sample_production() {
-    use dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig;
+    use dial9_tokio_telemetry::telemetry::CpuProfilingConfig;
 
-    let (writer, events) = common::CapturingWriter::new();
+    let dir = tempfile::tempdir().unwrap();
+    let trace_path = dir.path().join("trace.bin");
+    let writer = DiskWriter::single_file(&trace_path).unwrap();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(2).enable_all();
@@ -90,7 +130,7 @@ fn disable_stops_cpu_sample_production() {
     let (runtime, guard) = TracedRuntime::builder()
         .with_task_tracking(true)
         .with_cpu_profiling(CpuProfilingConfig::default())
-        .build_and_start_with_writer(builder, writer)
+        .build_and_start(builder, writer)
         .unwrap();
 
     let handle = guard.handle();
@@ -113,11 +153,9 @@ fn disable_stops_cpu_sample_production() {
         tokio::time::sleep(Duration::from_millis(1500)).await;
     });
 
-    let cpu_samples_phase1 = events
-        .lock()
-        .unwrap()
+    let cpu_samples_phase1 = read_events_on_disk(dir.path())
         .iter()
-        .filter(|e| matches!(e, TelemetryEvent::CpuSample { .. }))
+        .filter(|e| matches!(e, Dial9Event::CpuSampleEvent(_)))
         .count();
     assert!(
         cpu_samples_phase1 > 0,
@@ -130,7 +168,7 @@ fn disable_stops_cpu_sample_production() {
     // Wait for in-flight CPU samples to drain.
     std::thread::sleep(Duration::from_millis(1500));
 
-    let total_after_disable = events.lock().unwrap().len();
+    let total_after_disable = read_events_on_disk(dir.path()).len();
 
     // Phase 2: burn CPU while disabled — should NOT produce any events
     runtime.block_on(async {
@@ -149,7 +187,7 @@ fn disable_stops_cpu_sample_production() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
 
-    let total_after_phase2 = events.lock().unwrap().len();
+    let total_after_phase2 = read_events_on_disk(dir.path()).len();
 
     assert_eq!(
         total_after_disable,
@@ -163,7 +201,7 @@ fn disable_stops_cpu_sample_production() {
     drop(guard);
 }
 
-/// After `disable()`, the RotatingWriter must not produce new segments.
+/// After `disable()`, the DiskWriter must not produce new segments.
 ///
 /// Uses a 1-second rotation period and waits 5 seconds after disable.
 /// If the flush loop were still driving rotation, we'd see new `.bin`
@@ -173,7 +211,7 @@ fn disable_stops_segment_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let trace_path = dir.path().join("trace.bin");
 
-    let writer = RotatingWriter::builder()
+    let writer = DiskWriter::builder()
         .base_path(&trace_path)
         .max_file_size(100 * 1024 * 1024)
         .max_total_size(500 * 1024 * 1024)
@@ -248,7 +286,9 @@ fn disable_stops_segment_rotation() {
 /// After `disable()`, re-enabling with `enable()` should resume event production.
 #[test]
 fn enable_after_disable_resumes_events() {
-    let (writer, events) = common::CapturingWriter::new();
+    let dir = tempfile::tempdir().unwrap();
+    let trace_path = dir.path().join("trace.bin");
+    let writer = DiskWriter::single_file(&trace_path).unwrap();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(2).enable_all();
@@ -281,16 +321,15 @@ fn enable_after_disable_resumes_events() {
     drop(runtime);
     drop(guard);
 
-    let final_events = events.lock().unwrap();
-    let runtime_event_count = final_events
+    let runtime_event_count = read_events_on_disk(dir.path())
         .iter()
         .filter(|e| {
             matches!(
                 e,
-                TelemetryEvent::PollStart { .. }
-                    | TelemetryEvent::PollEnd { .. }
-                    | TelemetryEvent::WorkerPark { .. }
-                    | TelemetryEvent::WorkerUnpark { .. }
+                Dial9Event::PollStartEvent(_)
+                    | Dial9Event::PollEndEvent(_)
+                    | Dial9Event::WorkerParkEvent(_)
+                    | Dial9Event::WorkerUnparkEvent(_)
             )
         })
         .count();

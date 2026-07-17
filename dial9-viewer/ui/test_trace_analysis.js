@@ -14,9 +14,20 @@ const {
   flattenFlamegraph,
   buildFgData,
   buildSpanData,
+  indexPollsByTask,
+  resolveSpanTask,
+  reconstructSpanSegments,
   collectDescendants,
   selectSpanRenderSet,
   computeSpanLayout,
+  getTraceTimeRange,
+  hasCpuProfileSamples,
+  buildProcessCpuUsageSeries,
+  analyzeAllocations,
+  makeBarCoalescer,
+  computePollWakes,
+  pixelDownsampleSpans,
+  pixelCoverage,
 } = require("./trace_analysis.js");
 
 async function main() {
@@ -35,6 +46,117 @@ async function main() {
   function pass(msg) {
     console.log(`✓ ${msg}`);
   }
+
+  function testProfilerOnlyTraceRangeUsesCpuSamples() {
+    const profilerOnlyTrace = {
+      events: [],
+      cpuSamples: [
+        { timestamp: 300, source: 0, callchain: ["0x3"] },
+        { timestamp: 100, source: 0, callchain: ["0x1"] },
+        { timestamp: 200, source: 1, callchain: ["0x2"] },
+      ],
+    };
+
+    if (!hasCpuProfileSamples(profilerOnlyTrace.cpuSamples)) {
+      fail("CPU profile samples should make a trace displayable without runtime events");
+    }
+    const range = getTraceTimeRange(profilerOnlyTrace.events, profilerOnlyTrace.cpuSamples);
+    if (!range || range.minTs !== 100 || range.maxTs !== 300 || range.durationNs !== 200) {
+      fail(`profiler-only range should come from CPU profile samples, got ${JSON.stringify(range)}`);
+    }
+    pass("Profiler-only trace range uses CPU profile samples");
+  }
+
+  function testProfilerOnlyTraceRangeExpandsSingleCpuSample() {
+    const range = getTraceTimeRange([], [
+      { timestamp: 100, source: 0, callchain: ["0x1"] },
+    ]);
+    if (!range || range.minTs !== 100 || range.maxTs !== 101 || range.durationNs !== 1) {
+      fail(`single-sample profiler-only range should be non-zero, got ${JSON.stringify(range)}`);
+    }
+    pass("Single-sample profiler-only trace range is non-zero");
+  }
+
+  function testResourceOnlyTraceRangeUsesProcessResourceUsageEvents() {
+    const range = getTraceTimeRange([], [], [
+      { name: "OtherEvent", timestamp: 50, fields: {} },
+      { name: "ProcessResourceUsageEvent", timestamp: 300, fields: {} },
+      { name: "ProcessResourceUsageEvent", timestamp: 100, fields: {} },
+    ]);
+    if (!range || range.minTs !== 100 || range.maxTs !== 300 || range.durationNs !== 200) {
+      fail(`resource-only range should come from process resource usage events, got ${JSON.stringify(range)}`);
+    }
+    pass("Resource-only trace range uses process resource usage events");
+  }
+
+  function testProcessCpuUsageSeriesDerivesIntervals() {
+    const series = buildProcessCpuUsageSeries([
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 0,
+        fields: { user_cpu_ns: "100000000", system_cpu_ns: "50000000" },
+      },
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 1_000_000_000,
+        fields: { user_cpu_ns: "500000000", system_cpu_ns: "150000000" },
+      },
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 2_000_000_000,
+        fields: { user_cpu_ns: "1500000000", system_cpu_ns: "1150000000" },
+      },
+    ], "4");
+    if (series.availableParallelism !== 4) fail("available parallelism should parse as 4");
+    if (series.intervals.length !== 2) fail(`expected 2 CPU intervals, got ${series.intervals.length}`);
+    const first = series.intervals[0];
+    if (first.userDeltaNs !== 400_000_000 || first.systemDeltaNs !== 100_000_000) {
+      fail(`unexpected first CPU deltas: ${JSON.stringify(first)}`);
+    }
+    if (Math.abs(first.cores - 0.5) > 1e-9) fail(`expected first interval to use 0.5 cores, got ${first.cores}`);
+    if (Math.abs(first.totalPercent - 12.5) > 1e-9) fail(`expected first interval to use 12.5%, got ${first.totalPercent}`);
+    if (Math.abs(series.maxCores - 2.0) > 1e-9) fail(`expected max cores 2.0, got ${series.maxCores}`);
+    if (Math.abs(series.avgCores - 1.25) > 1e-9) fail(`expected avg cores 1.25, got ${series.avgCores}`);
+    pass("Process CPU usage series derives cores and total percentage");
+  }
+
+  function testProcessCpuUsageSeriesSkipsInvalidPairs() {
+    const series = buildProcessCpuUsageSeries([
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 0,
+        fields: { user_cpu_ns: "100", system_cpu_ns: "100" },
+      },
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 0,
+        fields: { user_cpu_ns: "200", system_cpu_ns: "200" },
+      },
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 10,
+        fields: { user_cpu_ns: "150", system_cpu_ns: "250" },
+      },
+      {
+        name: "ProcessResourceUsageEvent",
+        timestamp: 20,
+        fields: { user_cpu_ns: "300", system_cpu_ns: "350" },
+      },
+      { name: "OtherEvent", timestamp: 30, fields: {} },
+    ], null);
+    if (series.intervals.length !== 1) fail(`expected only one valid CPU interval, got ${series.intervals.length}`);
+    if (series.intervals[0].start !== 10 || series.intervals[0].end !== 20) {
+      fail(`expected valid interval [10, 20], got ${JSON.stringify(series.intervals[0])}`);
+    }
+    if (series.availableParallelism !== null) fail("missing available parallelism should stay null");
+    pass("Process CPU usage series skips invalid pairs");
+  }
+
+  testProfilerOnlyTraceRangeUsesCpuSamples();
+  testProfilerOnlyTraceRangeExpandsSingleCpuSample();
+  testResourceOnlyTraceRangeUsesProcessResourceUsageEvents();
+  testProcessCpuUsageSeriesDerivesIntervals();
+  testProcessCpuUsageSeriesSkipsInvalidPairs();
 
   const trace = await parseTrace(fs.readFileSync(tracePath));
   const evts = trace.events;
@@ -146,6 +268,89 @@ async function main() {
     pass(
       `${cpuResult.pollsWithCpuSamples} polls with cpu samples, ${cpuResult.pollsWithSchedSamples} with sched samples`
     );
+  }
+
+  function testInPollFlagMatchesAttachment() {
+    // attachCpuSamples must set sample.inPoll === true iff the sample was
+    // attached to a poll (the in-poll = real-blocking signal). Cross-check the
+    // flag against ground truth: the set of samples actually attached to polls.
+    const attached = new Set();
+    for (const w of workerIds) {
+      for (const p of workerSpans[w].polls) {
+        for (const s of p.cpuSamples || []) attached.add(s);
+        for (const s of p.schedSamples || []) attached.add(s);
+      }
+    }
+    let mismatches = 0;
+    for (const s of trace.cpuSamples) {
+      if (!!s.inPoll !== attached.has(s)) mismatches++;
+    }
+    if (mismatches > 0)
+      fail(`${mismatches} sample(s) have inPoll inconsistent with poll attachment`);
+    pass(`inPoll flag matches poll attachment for all ${trace.cpuSamples.length} samples`);
+  }
+
+  function testOffCpuSplitIsExhaustive() {
+    // Splitting off-CPU samples by inPoll must partition them exactly: every
+    // off-CPU sample is either in-poll (real blocking) or idle-park, never both
+    // or neither. This is the invariant the BLOCKING CALLS report relies on.
+    const offCpu = trace.cpuSamples.filter((s) => s.source === 1);
+    const inPoll = offCpu.filter((s) => s.inPoll);
+    const idle = offCpu.filter((s) => !s.inPoll);
+    if (inPoll.length + idle.length !== offCpu.length)
+      fail(
+        `off-CPU split not exhaustive: ${inPoll.length} + ${idle.length} != ${offCpu.length}`
+      );
+    pass(
+      `off-CPU split exhaustive: ${offCpu.length} = ${inPoll.length} in-poll + ${idle.length} idle-park`
+    );
+  }
+
+  function testSchedDelayMidPollWakeAdjustment() {
+    // Bug-1 regression guard: the mid-poll wake adjustment. If a wake lands
+    // inside an earlier poll of the same task, the delay must be measured from
+    // that poll's end, not the wake itself. The demo trace may not exercise
+    // this branch, so drive it with a synthetic two-poll task.
+    const ws = {
+      0: {
+        polls: [
+          { taskId: 1, start: 100, end: 200 },
+          { taskId: 1, start: 500, end: 600 },
+        ],
+      },
+    };
+    // Wake at t=150 lands inside the first poll [100,200].
+    const wakes = { 1: [{ timestamp: 150, wakerTaskId: 9 }] };
+    const r = computeSchedulingDelays(ws, [0], wakes);
+    // For poll #2 (start=500), effectiveWake should snap to poll #1.end = 200,
+    // giving delay = 500 - 200 = 300 (not 500 - 150 = 350).
+    if (r.length !== 1) fail(`expected 1 sched delay, got ${r.length}`);
+    if (r[0].wakeTime !== 200 || r[0].delay !== 300)
+      fail(
+        `mid-poll wake not adjusted: wakeTime=${r[0].wakeTime} delay=${r[0].delay} (expected 200/300)`
+      );
+    pass("mid-poll wake adjusted to containing poll's end (binary search)");
+  }
+
+  function testSchedDelayWakeInGapUnadjusted() {
+    // Counterpart: a wake that falls in the gap between polls (inside no poll)
+    // must NOT be adjusted — delay is measured straight from the wake.
+    const ws = {
+      0: {
+        polls: [
+          { taskId: 1, start: 100, end: 200 },
+          { taskId: 1, start: 500, end: 600 },
+        ],
+      },
+    };
+    const wakes = { 1: [{ timestamp: 300, wakerTaskId: 9 }] }; // in gap (200,500)
+    const r = computeSchedulingDelays(ws, [0], wakes);
+    if (r.length !== 1) fail(`expected 1 sched delay, got ${r.length}`);
+    if (r[0].wakeTime !== 300 || r[0].delay !== 200)
+      fail(
+        `gap wake wrongly adjusted: wakeTime=${r[0].wakeTime} delay=${r[0].delay} (expected 300/200)`
+      );
+    pass("wake in inter-poll gap left unadjusted");
   }
 
   // ── extractLocalQueueSamples (via buildWorkerSpans) ──
@@ -428,6 +633,56 @@ async function main() {
     pass("Unresolved addresses still produce a single tree level");
   }
 
+  function testFlamegraphWeightedSamples() {
+    const callframeSymbols = new Map([
+      ["0xA", [{ symbol: "alloc_fn", location: "alloc.rs:1" }]],
+      ["0xB", [{ symbol: "caller_fn", location: "caller.rs:1" }]],
+    ]);
+    // callchain is leaf-first: [leaf, ..., root]. Reversed internally to root→leaf.
+    const samples = [
+      { callchain: ["0xA", "0xB"], weight: 1000, allocWeight: 2 },
+      { callchain: ["0xA", "0xB"], weight: 500, allocWeight: 1.5 },
+      { callchain: ["0xA"], weight: 200, allocWeight: 1 },
+    ];
+    const tree = buildFlamegraphTree(samples, callframeSymbols);
+    if (tree.count !== 1700) fail(`root.count = ${tree.count}, expected 1700`);
+    if (tree.allocCount !== 4.5) fail(`root.allocCount = ${tree.allocCount}, expected 4.5`);
+    // First two samples: caller_fn -> alloc_fn. Third: alloc_fn only.
+    const caller = tree.children.get("caller_fn");
+    if (!caller) fail("expected caller_fn as child of root");
+    if (caller.count !== 1500) fail(`caller.count = ${caller.count}, expected 1500`);
+    if (caller.self !== 0) fail(`caller.self = ${caller.self}, expected 0`);
+    const alloc = caller.children.get("alloc_fn");
+    if (!alloc) fail("expected alloc_fn as child of caller_fn");
+    if (alloc.count !== 1500) fail(`alloc.count = ${alloc.count}, expected 1500`);
+    if (alloc.self !== 1500) fail(`alloc.self = ${alloc.self}, expected 1500`);
+    if (alloc.selfAllocCount !== 3.5) fail(`alloc.selfAllocCount = ${alloc.selfAllocCount}, expected 3.5`);
+    // Third sample: alloc_fn is root-level child
+    const allocDirect = tree.children.get("alloc_fn");
+    if (!allocDirect) fail("expected alloc_fn as direct child of root for single-frame sample");
+    if (allocDirect.count !== 200) fail(`allocDirect.count = ${allocDirect.count}, expected 200`);
+    if (allocDirect.self !== 200) fail(`allocDirect.self = ${allocDirect.self}, expected 200`);
+    if (allocDirect.selfAllocCount !== 1) fail(`allocDirect.selfAllocCount = ${allocDirect.selfAllocCount}, expected 1`);
+    pass("Weighted samples accumulate count, self, allocCount, selfAllocCount correctly");
+  }
+
+  function testFlamegraphDefaultWeightBackcompat() {
+    const callframeSymbols = new Map([
+      ["0xC", [{ symbol: "cpu_fn", location: "cpu.rs:1" }]],
+    ]);
+    const samples = [
+      { callchain: ["0xC"] },
+      { callchain: ["0xC"] },
+    ];
+    const tree = buildFlamegraphTree(samples, callframeSymbols);
+    if (tree.count !== 2) fail(`root.count = ${tree.count}, expected 2`);
+    const node = tree.children.get("cpu_fn");
+    if (node.count !== 2) fail(`node.count = ${node.count}, expected 2`);
+    if (node.self !== 2) fail(`node.self = ${node.self}, expected 2`);
+    if (node.allocCount != null) fail(`node.allocCount should be undefined for unweighted samples`);
+    pass("Unweighted samples default to weight=1, no allocCount fields");
+  }
+
   // ── TaskDumpEvent parsing (verified against the demo trace) ──
 
   function testTaskDumpsParsed() {
@@ -576,7 +831,23 @@ async function main() {
     const beta = allSpans.find(s => s.spanName === "beta");
     if (!alpha || !beta) fail("Missing alpha or beta span");
     if (alpha.start !== 1000 || beta.start !== 2000) fail("Span intervals not distinct");
-    pass("Recycled span IDs produce separate intervals");
+    // The viewer's per-lane highlight loop relies on grouping allSpans by
+    // spanId into a multimap (spansByIdAll) and lighting up EVERY instance —
+    // not a single last-wins entry. Assert that recycled id 1 indeed yields
+    // two grouped instances, so the highlight stays correct under recycling.
+    const byId = new Map();
+    for (const s of allSpans) {
+      let b = byId.get(s.spanId);
+      if (!b) { b = []; byId.set(s.spanId, b); }
+      b.push(s);
+    }
+    // spanId is keyed exactly as stored on the span objects (a string here),
+    // the same value the viewer puts in selectedSpanIds — so the multimap key
+    // is alpha.spanId, not a numeric literal.
+    if ((byId.get(alpha.spanId) || []).length !== 2)
+      fail(`Expected id ${JSON.stringify(alpha.spanId)} to group 2 recycled spans, got ${(byId.get(alpha.spanId) || []).length}`);
+    if (alpha.spanId !== beta.spanId) fail("Recycled spans should share the same spanId key");
+    pass("Recycled span IDs produce separate intervals (and group by id)");
   }
 
   function testBuildSpanDataPerCallsiteSchema() {
@@ -594,6 +865,32 @@ async function main() {
     if (allSpans[0].fields.worker_id) fail("worker_id should not be in user fields");
     if (allSpans[0].fields.span_name) fail("span_name should not be in user fields");
     pass("Per-callsite schema with typed fields parsed correctly");
+  }
+
+  function testBuildSpanDataDerivedStructSchema() {
+    // Hand-written `#[derive(TraceEvent)]` span structs cannot put ':' in their
+    // wire name (it's a Rust identifier), so they use the "SpanEnter__"/
+    // "SpanExit__" prefix instead. The viewer must classify these as spans too.
+    const customEvents = [
+      { name: "SpanEnter__DemoOp", timestamp: 1000, fields: { worker_id: 0, span_id: 1, parent_span_id: null, span_name: "request", operation: "GET /widgets", detail: "request #0" } },
+      { name: "SpanEnter__DemoOp", timestamp: 1100, fields: { worker_id: 0, span_id: 2, parent_span_id: 1, span_name: "db_query", operation: "SELECT widgets", detail: "query for request #0" } },
+      { name: "SpanExit__DemoOp",  timestamp: 1200, fields: { worker_id: 0, span_id: 2, span_name: "db_query" } },
+      { name: "SpanExit__DemoOp",  timestamp: 1300, fields: { worker_id: 0, span_id: 1, span_name: "request" } },
+    ];
+    const { allSpans, maxDepth } = buildSpanData(customEvents);
+    if (allSpans.length !== 2) fail(`Expected 2 spans, got ${allSpans.length}`);
+    const req = allSpans.find(s => s.spanName === "request");
+    const q = allSpans.find(s => s.spanName === "db_query");
+    if (!req || !q) fail("Missing request or db_query span");
+    // Both an interned (operation) and an inline (detail) user field should
+    // surface; base fields should not.
+    if (req.fields.operation !== "GET /widgets") fail(`Expected operation='GET /widgets', got '${req.fields.operation}'`);
+    if (req.fields.detail !== "request #0") fail(`Expected detail='request #0', got '${req.fields.detail}'`);
+    if (req.fields.span_name) fail("span_name should not be in user fields");
+    // Nesting via parent_span_id must be reconstructed.
+    if (q.parentSpanId !== "1") fail(`Expected db_query parent '1', got '${q.parentSpanId}'`);
+    if (maxDepth !== 1) fail(`Expected maxDepth=1, got ${maxDepth}`);
+    pass("Derived-struct span schema (SpanEnter__/SpanExit__) parsed correctly");
   }
 
   function testBuildSpanDataUnmatched() {
@@ -837,6 +1134,206 @@ async function main() {
     pass("Multiple polls grouped into single span with segments");
   }
 
+  function testBuildSpanDataSegmentUsesEnterWorker() {
+    // Regression: a long-lived span entered on one worker and exited on a
+    // different worker (its task migrated between enter and exit). The segment's
+    // `start` is the ENTER timestamp, so the segment must carry the ENTER
+    // worker — otherwise the viewer's span->task lookup (find the poll on
+    // segment.workerId that overlaps segment.start) searches the wrong worker's
+    // poll timeline at the enter time, finds nothing, and fails to select a
+    // task. Single enter/exit pair, workers differ.
+    const customEvents = [
+      { name: "SpanEnter:app::req:req.rs:1", timestamp: 1000, fields: { worker_id: 3, span_id: 1, parent_span_id: null, span_name: "handle_request" } },
+      { name: "SpanExit:app::req:req.rs:1",  timestamp: 5000, fields: { worker_id: 7, span_id: 1, span_name: "handle_request" } },
+    ];
+    const { allSpans } = buildSpanData(customEvents);
+    if (allSpans.length !== 1) fail(`Expected 1 span, got ${allSpans.length}`);
+    const seg = allSpans[0].segments[0];
+    if (seg.start !== 1000 || seg.end !== 5000) fail(`Segment timing wrong: ${seg.start}-${seg.end}`);
+    // The segment start is the enter time (1000, on worker 3), so the segment
+    // must be attributed to worker 3, not the exit worker 7.
+    if (seg.workerId !== 3) fail(`Expected segment workerId=3 (enter worker), got ${seg.workerId}`);
+    pass("Cross-worker enter/exit: segment carries the enter worker");
+  }
+
+  // ── reconstructSpanSegments (unit) ──
+
+  function testReconstructSegmentsCarvesIdleGaps() {
+    // One coarse segment [0,1000] intersected with a task polled twice
+    // ([100,200] on w0, [500,600] on w1). Result: two active segments with an
+    // idle gap between; workers come from the polls, not the raw segment.
+    const raw = [{ start: 0, end: 1000, workerId: 9 }];
+    const taskPolls = [
+      { start: 100, end: 200, workerId: 0 },
+      { start: 500, end: 600, workerId: 1 },
+    ];
+    const segs = reconstructSpanSegments(raw, taskPolls);
+    if (segs.length !== 2) fail(`Expected 2 segments, got ${segs.length}`);
+    if (segs[0].start !== 100 || segs[0].end !== 200 || segs[0].workerId !== 0) fail(`seg0 wrong: ${JSON.stringify(segs[0])}`);
+    if (segs[1].start !== 500 || segs[1].end !== 600 || segs[1].workerId !== 1) fail(`seg1 wrong: ${JSON.stringify(segs[1])}`);
+    pass("reconstructSpanSegments carves a coarse segment into per-poll active segments");
+  }
+
+  function testReconstructSegmentsClampsToSpanWindow() {
+    // Polls extending past the segment on both ends are clamped to [start,end].
+    const raw = [{ start: 300, end: 700, workerId: 0 }];
+    const taskPolls = [
+      { start: 100, end: 400, workerId: 0 }, // overlaps left edge
+      { start: 600, end: 900, workerId: 0 }, // overlaps right edge
+    ];
+    const segs = reconstructSpanSegments(raw, taskPolls);
+    if (segs.length !== 2) fail(`Expected 2 segments, got ${segs.length}`);
+    if (segs[0].start !== 300 || segs[0].end !== 400) fail(`left clamp wrong: ${JSON.stringify(segs[0])}`);
+    if (segs[1].start !== 600 || segs[1].end !== 700) fail(`right clamp wrong: ${JSON.stringify(segs[1])}`);
+    pass("reconstructSpanSegments clamps overlapping polls to the segment window");
+  }
+
+  function testReconstructSegmentsFallsBackWhenNoOverlap() {
+    // Span window falls entirely between the task's polls -> no intersection.
+    // Rather than drop the span, keep the raw segments so it still renders.
+    const raw = [{ start: 300, end: 400, workerId: 5 }];
+    const taskPolls = [
+      { start: 0, end: 100, workerId: 0 },
+      { start: 700, end: 800, workerId: 0 },
+    ];
+    const segs = reconstructSpanSegments(raw, taskPolls);
+    if (segs !== raw) fail("Expected raw segments returned by reference on no overlap");
+    pass("reconstructSpanSegments falls back to raw segments when no poll overlaps");
+  }
+
+  function testReconstructSegmentsNoPollsIsIdentity() {
+    const raw = [{ start: 0, end: 10, workerId: 0 }];
+    if (reconstructSpanSegments(raw, undefined) !== raw) fail("undefined polls should return raw");
+    if (reconstructSpanSegments(raw, []) !== raw) fail("empty polls should return raw");
+    pass("reconstructSpanSegments is identity when task has no polls");
+  }
+
+  function testReconstructSegmentsMultipleRawSegments() {
+    // A span already carrying two per-poll raw segments (e.g. re-entered).
+    // Each is intersected independently; a poll landing in the gap BETWEEN the
+    // two raw segments must NOT be attributed to the span.
+    const raw = [
+      { start: 100, end: 200, workerId: 0 },
+      { start: 500, end: 600, workerId: 0 },
+    ];
+    const taskPolls = [
+      { start: 120, end: 180, workerId: 0 }, // inside raw[0]
+      { start: 300, end: 400, workerId: 0 }, // in the gap — must be excluded
+      { start: 520, end: 640, workerId: 1 }, // overlaps raw[1], clamped to 600
+    ];
+    const segs = reconstructSpanSegments(raw, taskPolls);
+    if (segs.length !== 2) fail(`Expected 2 segments (gap poll excluded), got ${segs.length}: ${JSON.stringify(segs)}`);
+    if (segs[0].start !== 120 || segs[0].end !== 180) fail(`seg0 wrong: ${JSON.stringify(segs[0])}`);
+    if (segs[1].start !== 520 || segs[1].end !== 600 || segs[1].workerId !== 1) fail(`seg1 wrong: ${JSON.stringify(segs[1])}`);
+    pass("reconstructSpanSegments intersects each raw segment independently (gap polls excluded)");
+  }
+
+  // ── resolveSpanTask (unit) ──
+
+  function testResolveSpanTaskBinarySearch() {
+    // Covering poll found among many; and a timestamp in an inter-poll gap
+    // resolves to null (not the nearest poll).
+    const workerSpans = {
+      2: { polls: [
+        { start: 0, end: 100, taskId: 11 },
+        { start: 200, end: 300, taskId: 22 },
+        { start: 400, end: 500, taskId: 33 },
+      ] },
+    };
+    if (resolveSpanTask({ start: 250, workerId: 2 }, workerSpans) !== 22) fail("Expected task 22 for ts=250");
+    if (resolveSpanTask({ start: 400, workerId: 2 }, workerSpans) !== 33) fail("Expected task 33 at poll start edge");
+    if (resolveSpanTask({ start: 150, workerId: 2 }, workerSpans) !== null) fail("Gap timestamp should resolve to null");
+    if (resolveSpanTask({ start: 250, workerId: 9 }, workerSpans) !== null) fail("Unknown worker should resolve to null");
+    pass("resolveSpanTask binary-searches the covering poll; gaps and unknown workers -> null");
+  }
+
+  function testResolveSpanTaskZeroTaskIdIsNull() {
+    // A poll covers the timestamp but has taskId 0 (block-in-place stub) ->
+    // treated as "no task", not task 0.
+    const workerSpans = { 0: { polls: [{ start: 0, end: 100, taskId: 0 }] } };
+    if (resolveSpanTask({ start: 50, workerId: 0 }, workerSpans) !== null) fail("taskId 0 should resolve to null");
+    pass("resolveSpanTask treats a covering poll with taskId 0 as null");
+  }
+
+  function testBuildSpanDataRecycledTaskIdNotBorrowed() {
+    // Task id 7 is recycled: instance A polled at [1000,1100], then a LATER
+    // instance polled at [50000,50100]. A span owned by instance A (enter at
+    // 1000, exit at 1200) must only pick up A's poll, not the recycled
+    // instance's — the `p.start > seg.end` break in reconstructSpanSegments
+    // guards this.
+    const workerSpans = {
+      0: { polls: [
+        { start: 900, end: 1100, taskId: 7 },   // instance A, covers enter
+        { start: 50000, end: 50100, taskId: 7 }, // recycled instance, far later
+      ] },
+    };
+    const customEvents = [
+      { name: "SpanEnter:app::f:f:1", timestamp: 1000, fields: { worker_id: 0, span_id: 1, parent_span_id: null, span_name: "f" } },
+      { name: "SpanExit:app::f:f:1",  timestamp: 1200, fields: { worker_id: 0, span_id: 1, span_name: "f" } },
+    ];
+    const { allSpans } = buildSpanData(customEvents, workerSpans);
+    const s = allSpans[0];
+    if (s.taskId !== 7) fail(`Expected taskId=7, got ${s.taskId}`);
+    if (s.segments.length !== 1) fail(`Expected 1 segment (recycled poll excluded), got ${s.segments.length}`);
+    if (s.segments[0].end !== 1100) fail(`Expected segment clamped to 1100, got ${s.segments[0].end}`);
+    if (s.activeNs !== 100) fail(`Expected activeNs=100, got ${s.activeNs}`);
+    pass("buildSpanData does not borrow a recycled task-id's later polls");
+  }
+
+  // ── buildSpanData with poll-based reconstruction (integration) ──
+
+  function testBuildSpanDataReconstructsFromTaskPolls() {
+    // A long-lived request span: single SpanEnter/SpanExit pair [1000, 9000],
+    // but its owning task (id 42) was only polled twice in that window. The
+    // enter (worker 0, t=1000) falls inside poll [900,1100] which identifies
+    // task 42. Reconstruction should replace the one coarse segment with the
+    // two real on-CPU polls and expose the idle gap between them.
+    const workerSpans = {
+      0: { polls: [
+        { start: 900, end: 1100, taskId: 42 },   // covers the enter -> resolves task 42
+        { start: 8800, end: 8900, taskId: 42 },
+      ] },
+      1: { polls: [
+        { start: 4000, end: 4100, taskId: 42 },   // task migrated to worker 1
+      ] },
+    };
+    const customEvents = [
+      { name: "SpanEnter:app::req:req.rs:1", timestamp: 1000, fields: { worker_id: 0, span_id: 1, parent_span_id: null, span_name: "GET /jobs/next" } },
+      { name: "SpanExit:app::req:req.rs:1",  timestamp: 9000, fields: { worker_id: 1, span_id: 1, span_name: "GET /jobs/next" } },
+    ];
+    const { allSpans } = buildSpanData(customEvents, workerSpans);
+    if (allSpans.length !== 1) fail(`Expected 1 span, got ${allSpans.length}`);
+    const s = allSpans[0];
+    // Span lifetime unchanged (the on-wire enter/exit).
+    if (s.start !== 1000 || s.end !== 9000) fail(`Span window wrong: ${s.start}-${s.end}`);
+    // Owning task resolved and stored on the span.
+    if (s.taskId !== 42) fail(`Expected taskId=42, got ${s.taskId}`);
+    // Three polls of task 42 fall in [1000,9000]: [1000,1100], [4000,4100], [8800,8900].
+    if (s.segments.length !== 3) fail(`Expected 3 reconstructed segments, got ${s.segments.length}`);
+    if (s.segments[0].start !== 1000 || s.segments[0].end !== 1100) fail(`seg0 wrong: ${JSON.stringify(s.segments[0])}`);
+    if (s.segments[1].workerId !== 1) fail(`seg1 should be on worker 1 (migrated), got ${s.segments[1].workerId}`);
+    // activeNs = 100 + 100 + 100 = 300, far below the 8000 wall-clock lifetime.
+    if (s.activeNs !== 300) fail(`Expected activeNs=300, got ${s.activeNs}`);
+    const idle = (s.end - s.start) - s.activeNs;
+    if (idle !== 7700) fail(`Expected idle=7700, got ${idle}`);
+    pass("buildSpanData reconstructs active/idle segments from the owning task's polls");
+  }
+
+  function testBuildSpanDataNoWorkerSpansKeepsRawSegments() {
+    // Without workerSpans, behavior is unchanged: raw on-wire segment, no taskId.
+    const customEvents = [
+      { name: "SpanEnter:app::req:req.rs:1", timestamp: 1000, fields: { worker_id: 0, span_id: 1, parent_span_id: null, span_name: "req" } },
+      { name: "SpanExit:app::req:req.rs:1",  timestamp: 9000, fields: { worker_id: 0, span_id: 1, span_name: "req" } },
+    ];
+    const { allSpans } = buildSpanData(customEvents);
+    if (allSpans.length !== 1) fail(`Expected 1 span, got ${allSpans.length}`);
+    const s = allSpans[0];
+    if (s.segments.length !== 1) fail(`Expected 1 raw segment, got ${s.segments.length}`);
+    if (s.activeNs !== 8000) fail(`Expected activeNs=8000 (raw), got ${s.activeNs}`);
+    if (s.taskId !== null) fail(`Expected taskId=null without workerSpans, got ${s.taskId}`);
+    pass("buildSpanData without workerSpans keeps raw segments (backwards compatible)");
+  }
+
   function testBuildSpanDataOutOfOrder() {
     // Events arrive out of order across workers — buildSpanData sorts by timestamp.
     // Also tests the defensive guard: span 1 enters on worker 0, then enters again
@@ -887,6 +1384,35 @@ async function main() {
     pass("Open PollStart at trace end is discarded (no phantom long poll)");
   }
 
+  // ── Block-in-place active-span suppression ──
+
+  function testBlockInPlaceActiveSpanSuppression() {
+    // Synthetic events: worker 0 unparks on tid=42, then parks on tid=99
+    // (a block_in_place handoff). The active span [10, 50) crosses the gap
+    // and must be discarded. A subsequent normal active span [60, 70) on
+    // tid=99 should be preserved.
+    const syntheticEvents = [
+      { eventType: EVENT_TYPES.WorkerUnpark, timestamp: 10, workerId: 0, tid: 42, cpuTime: 100, schedWait: 0, localQueue: 0, globalQueue: 0, taskId: 0, spawnLocId: null, spawnLoc: null },
+      { eventType: EVENT_TYPES.WorkerPark, timestamp: 50, workerId: 0, tid: 99, cpuTime: 500, localQueue: 0, globalQueue: 0, schedWait: 0, taskId: 0, spawnLocId: null, spawnLoc: null },
+      { eventType: EVENT_TYPES.WorkerUnpark, timestamp: 60, workerId: 0, tid: 99, cpuTime: 600, schedWait: 0, localQueue: 0, globalQueue: 0, taskId: 0, spawnLocId: null, spawnLoc: null },
+      { eventType: EVENT_TYPES.WorkerPark, timestamp: 70, workerId: 0, tid: 99, cpuTime: 700, localQueue: 0, globalQueue: 0, schedWait: 0, taskId: 0, spawnLocId: null, spawnLoc: null },
+    ];
+    const gaps = [{ workerId: 0, fromTid: 42, toTid: 99, startNs: 10, endNs: 50 }];
+    const result = buildWorkerSpans(syntheticEvents, [0], 100, gaps);
+    const actives = result.workerSpans[0].actives;
+    // The first active [10,50) crosses the gap → suppressed.
+    // The second active [60,70) is clean → preserved.
+    if (actives.length !== 1) {
+      fail(`Expected 1 active span (gap-crossing suppressed), got ${actives.length}: ${JSON.stringify(actives)}`);
+      return;
+    }
+    if (actives[0].start !== 60 || actives[0].end !== 70) {
+      fail(`Expected active [60,70), got [${actives[0].start},${actives[0].end})`);
+      return;
+    }
+    pass("Active span crossing block-in-place gap is suppressed; clean span preserved");
+  }
+
   // ── Run all tests ──
 
   console.log("\nbuildWorkerSpans:");
@@ -900,6 +1426,8 @@ async function main() {
   console.log("\nattachCpuSamples:");
   testAttachedSamplesWithinPollBounds();
   testCpuResultCounts();
+  testInPollFlagMatchesAttachment();
+  testOffCpuSplitIsExhaustive();
 
   console.log("\nextractLocalQueueSamples:");
   testLocalQueueNonNegative();
@@ -919,6 +1447,8 @@ async function main() {
   testDelaysBounded();
   testWakeBeforePoll();
   testDelaysSorted();
+  testSchedDelayMidPollWakeAdjustment();
+  testSchedDelayWakeInGapUnadjusted();
 
   console.log("\nfilterPointsOfInterest:");
   testLongPollFilter();
@@ -934,6 +1464,8 @@ async function main() {
   testFlamegraphInlineOrder();
   testFlamegraphInlineTolerantOfNullSlots();
   testFlamegraphUnknownAddress();
+  testFlamegraphWeightedSamples();
+  testFlamegraphDefaultWeightBackcompat();
 
   console.log("\ntaskDumps:");
   testTaskDumpsParsed();
@@ -949,9 +1481,21 @@ async function main() {
   testBuildSpanDataCycleDetection();
   testBuildSpanDataRecycledId();
   testBuildSpanDataPerCallsiteSchema();
+  testBuildSpanDataDerivedStructSchema();
   testBuildSpanDataUnmatched();
   testBuildSpanDataChildrenIndex();
   testBuildSpanDataMultiplePolls();
+  testBuildSpanDataSegmentUsesEnterWorker();
+  testReconstructSegmentsCarvesIdleGaps();
+  testReconstructSegmentsClampsToSpanWindow();
+  testReconstructSegmentsFallsBackWhenNoOverlap();
+  testReconstructSegmentsNoPollsIsIdentity();
+  testReconstructSegmentsMultipleRawSegments();
+  testResolveSpanTaskBinarySearch();
+  testResolveSpanTaskZeroTaskIdIsNull();
+  testBuildSpanDataReconstructsFromTaskPolls();
+  testBuildSpanDataNoWorkerSpansKeepsRawSegments();
+  testBuildSpanDataRecycledTaskIdNotBorrowed();
   testBuildSpanDataOutOfOrder();
 
   console.log("\nspan pane layout:");
@@ -961,6 +1505,519 @@ async function main() {
   testComputeSpanLayoutDurationY();
   testComputeSpanLayoutClusters();
   testComputeSpanLayoutRepresentativeIsLongest();
+
+  console.log("\nblock-in-place active-span suppression:");
+  testBlockInPlaceActiveSpanSuppression();
+
+  console.log("\ncomputePollWakes:");
+  testPollWakesMatchesBruteForce();
+  testPollWakesNoWakes();
+  testPollWakesMidPollBump();
+  testPollWakesSharedBoundary();
+
+  // Reference O(P^2) implementation — the original viewer loop, kept here to
+  // prove the binary-search version produces identical results.
+  function pollWakesBruteForce(polls, wakes) {
+    const out = [];
+    for (let pi = 0; pi < polls.length; pi++) {
+      const s = polls[pi];
+      let best = null;
+      if (wakes.length) {
+        let lo = 0, hi = wakes.length - 1, bi = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (wakes[mid].timestamp <= s.start) { bi = mid; lo = mid + 1; }
+          else hi = mid - 1;
+        }
+        if (bi >= 0) {
+          const w = wakes[bi];
+          let effectiveWake = w.timestamp;
+          for (let j = 0; j < pi; j++) {
+            if (w.timestamp >= polls[j].start && w.timestamp <= polls[j].end) {
+              effectiveWake = polls[j].end;
+              break;
+            }
+          }
+          const delay = s.start - effectiveWake;
+          if (delay >= 0 && delay < 1e9) best = { wake: w, effectiveWake };
+        }
+      }
+      out.push(best);
+    }
+    return out;
+  }
+
+  function testPollWakesMatchesBruteForce() {
+    // Deterministic pseudo-random non-overlapping polls + scattered wakes.
+    const polls = [];
+    let t = 0;
+    let seed = 12345;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    for (let i = 0; i < 400; i++) {
+      const gap = Math.floor(rnd() * 50);
+      const dur = 1 + Math.floor(rnd() * 80);
+      const start = t + gap;
+      polls.push({ start, end: start + dur });
+      t = start + dur;
+    }
+    const wakes = [];
+    for (let i = 0; i < 600; i++) {
+      wakes.push({ timestamp: Math.floor(rnd() * t), wakerTaskId: i });
+    }
+    // Deliberately seed wakes EXACTLY on poll boundaries (poll.start, which for
+    // a zero-gap poll equals the previous poll's end). This is the case where a
+    // wake is contained by two adjacent polls and where the binary-search and
+    // O(P^2) versions can disagree on which poll "owns" it — so the comparison
+    // below actually exercises the first-match tie-break, not just interiors.
+    for (let i = 0; i < polls.length; i += 7) {
+      wakes.push({ timestamp: polls[i].start, wakerTaskId: 1000 + i });
+      wakes.push({ timestamp: polls[i].end, wakerTaskId: 2000 + i });
+    }
+    wakes.sort((a, b) => a.timestamp - b.timestamp);
+
+    const fast = computePollWakes(polls, wakes);
+    const slow = pollWakesBruteForce(polls, wakes);
+    if (fast.length !== slow.length) fail(`pollWakes: length mismatch ${fast.length} vs ${slow.length}`);
+    for (let i = 0; i < slow.length; i++) {
+      const a = fast[i], b = slow[i];
+      if ((a == null) !== (b == null)) fail(`pollWakes[${i}]: null mismatch`);
+      if (a && b) {
+        if (a.effectiveWake !== b.effectiveWake)
+          fail(`pollWakes[${i}]: effectiveWake ${a.effectiveWake} vs ${b.effectiveWake}`);
+        if (a.wake.wakerTaskId !== b.wake.wakerTaskId)
+          fail(`pollWakes[${i}]: wake mismatch`);
+      }
+    }
+    pass("binary-search computePollWakes matches O(P^2) reference (400 polls, 600 wakes)");
+  }
+
+  function testPollWakesNoWakes() {
+    const polls = [{ start: 0, end: 10 }, { start: 20, end: 30 }];
+    const out = computePollWakes(polls, []);
+    if (out.length !== 2 || out[0] !== null || out[1] !== null)
+      fail("pollWakes: empty wakes should yield all-null");
+    pass("no wakes yields all-null result");
+  }
+
+  function testPollWakesMidPollBump() {
+    // Wake at t=5 lands inside poll[0] [0,10]; poll[1] starts at 20.
+    // effectiveWake for poll[1] must bump to poll[0].end (10), not 5.
+    const polls = [{ start: 0, end: 10 }, { start: 20, end: 30 }];
+    const wakes = [{ timestamp: 5, wakerTaskId: 99 }];
+    const out = computePollWakes(polls, wakes);
+    // poll[0]: wake at 5 <= start 0? no — rightmost wake <= 0 is none → null.
+    if (out[0] !== null) fail("pollWakes: poll[0] should have no qualifying wake");
+    if (!out[1] || out[1].effectiveWake !== 10)
+      fail(`pollWakes: poll[1] effectiveWake should bump to 10, got ${out[1] && out[1].effectiveWake}`);
+    pass("wake landing mid-earlier-poll bumps effectiveWake to that poll's end");
+  }
+
+  function testPollWakesSharedBoundary() {
+    // A wake landing on a shared poll boundary (poll0.end == poll1.start == t)
+    // is contained by BOTH adjacent polls. The original O(P^2) loop took the
+    // FIRST (lowest-index) match, so effectiveWake = poll0.end == t (no bump).
+    // The binary search finds the rightmost poll with start <= t (poll1), so it
+    // must walk left to poll0 to stay faithful. Without that walk it would
+    // wrongly report poll1.end.
+    const polls = [{ start: 0, end: 10 }, { start: 10, end: 20 }, { start: 30, end: 40 }];
+    const wakes = [{ timestamp: 10, wakerTaskId: 7 }];
+    const out = computePollWakes(polls, wakes);
+    if (!out[2] || out[2].effectiveWake !== 10)
+      fail(`pollWakes: shared-boundary effectiveWake should be 10 (first match), got ${out[2] && out[2].effectiveWake}`);
+
+    // Zero-width poll chain all touching t=10: lowest-index match is poll0.
+    const chain = [{ start: 0, end: 10 }, { start: 10, end: 10 }, { start: 10, end: 20 }, { start: 30, end: 40 }];
+    const cout = computePollWakes(chain, wakes);
+    if (!cout[3] || cout[3].effectiveWake !== 10)
+      fail(`pollWakes: boundary-chain effectiveWake should be 10, got ${cout[3] && cout[3].effectiveWake}`);
+    pass("wake on a shared poll boundary matches first-match (lowest-index) semantics");
+  }
+
+  console.log("\npixelDownsampleSpans:");
+  const _dur = (s) => s.end - s.start;
+  function ffvByStart(spans, vs) {
+    let lo = 0, hi = spans.length - 1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (spans[m].end < vs) lo = m + 1; else hi = m - 1; }
+    return lo;
+  }
+  testDownsampleBoundsOutputByPixels();
+  testDownsampleKeepsLongestPerColumn();
+  testDownsamplePassThroughWhenSparse();
+  testDownsampleStartIdxAndBreak();
+  testDownsampleEmpty();
+
+  function testDownsampleBoundsOutputByPixels() {
+    // 100k spans over a 200px lane → at most 200 representatives.
+    const spans = [];
+    for (let i = 0; i < 100000; i++) spans.push({ start: i, end: i + 1 });
+    const reps = pixelDownsampleSpans(spans, 0, 0, 100000, 200, _dur);
+    if (reps.length > 200) fail(`downsample: expected ≤200 reps, got ${reps.length}`);
+    if (reps.length < 1) fail("downsample: expected some reps");
+    pass(`100k spans over 200px → ${reps.length} reps (≤200)`);
+  }
+
+  function testDownsampleKeepsLongestPerColumn() {
+    // Three spans in the same pixel column; the longest must be the rep.
+    // viewDur=1000 over pw=10 → 100ns per pixel. All three start in [0,100).
+    const spans = [
+      { start: 0,  end: 5,  id: "a" },
+      { start: 10, end: 90, id: "b" }, // longest
+      { start: 20, end: 25, id: "c" },
+    ];
+    const reps = pixelDownsampleSpans(spans, 0, 0, 1000, 10, _dur);
+    if (reps.length !== 1) fail(`downsample: expected 1 rep in column, got ${reps.length}`);
+    if (reps[0].id !== "b") fail(`downsample: expected longest 'b', got '${reps[0].id}'`);
+    pass("longest span wins its pixel column");
+  }
+
+  function testDownsamplePassThroughWhenSparse() {
+    // Spans already spread > 1px apart: all survive, order preserved.
+    const spans = [
+      { start: 0,   end: 10 },
+      { start: 500, end: 510 },
+      { start: 999, end: 1000 },
+    ];
+    const reps = pixelDownsampleSpans(spans, 0, 0, 1000, 1000, _dur);
+    if (reps.length !== 3) fail(`downsample: expected 3 reps when sparse, got ${reps.length}`);
+    if (reps[0].start !== 0 || reps[2].start !== 999) fail("downsample: order/identity not preserved");
+    pass("sparse spans pass through unchanged");
+  }
+
+  function testDownsampleStartIdxAndBreak() {
+    // startIdx skips earlier spans; iteration breaks past viewEnd.
+    const spans = [];
+    for (let i = 0; i < 1000; i++) spans.push({ start: i * 10, end: i * 10 + 5 });
+    // view [2000, 3000]; binary-search start, downsample over wide pw so no merging.
+    const startIdx = ffvByStart(spans, 2000);
+    const reps = pixelDownsampleSpans(spans, startIdx, 2000, 3000, 100000, _dur);
+    for (const r of reps) {
+      if (r.start > 3000) fail(`downsample: rep past viewEnd (${r.start})`);
+      if (r.end < 2000) fail(`downsample: rep before viewStart (${r.end})`);
+    }
+    if (reps.length < 1) fail("downsample: expected reps in window");
+    pass("respects startIdx and breaks past viewEnd");
+  }
+
+  function testDownsampleEmpty() {
+    if (pixelDownsampleSpans([], 0, 0, 1000, 100, _dur).length !== 0) fail("downsample: empty in → empty out");
+    if (pixelDownsampleSpans([{start:0,end:1}], 0, 0, 0, 100, _dur).length !== 0) fail("downsample: zero viewDur → empty");
+    if (pixelDownsampleSpans([{start:0,end:1}], 0, 0, 1000, 0, _dur).length !== 0) fail("downsample: zero pw → empty");
+    pass("empty / degenerate inputs yield no reps");
+  }
+
+  console.log("\npixelCoverage:");
+  testCoverageFullColumn();
+  testCoverageHalf();
+  testCoverageSparseStaysSparse();
+  testCoverageSpanAcrossColumns();
+  testCoverageClampedToView();
+  testCoverageDegenerate();
+
+  function approx(a, b, eps) { return Math.abs(a - b) <= (eps || 1e-9); }
+
+  function testCoverageFullColumn() {
+    // One span exactly filling the whole view → every column ≈ 1.
+    const cov = pixelCoverage([{ start: 0, end: 100 }], 0, 0, 100, 10);
+    for (let i = 0; i < cov.length; i++)
+      if (!approx(cov[i], 1)) fail(`coverage: col ${i} expected ~1, got ${cov[i]}`);
+    pass("span filling the view → all columns fully covered");
+  }
+
+  function testCoverageHalf() {
+    // 100ns view over 10px = 10ns/px. A span covering [0,50) fills cols 0-4,
+    // leaves cols 5-9 empty.
+    const cov = pixelCoverage([{ start: 0, end: 50 }], 0, 0, 100, 10);
+    for (let i = 0; i < 5; i++) if (!approx(cov[i], 1)) fail(`coverage: col ${i} expected ~1, got ${cov[i]}`);
+    for (let i = 5; i < 10; i++) if (!approx(cov[i], 0)) fail(`coverage: col ${i} expected 0, got ${cov[i]}`);
+    pass("half-covered view → half the columns full, half empty");
+  }
+
+  function testCoverageSparseStaysSparse() {
+    // 10 tiny polls (1ns each) scattered across a 1000ns view at 10px.
+    // Each column is 100ns wide; total covered time per column ≪ 1 → faint,
+    // NOT solid. This is the misleading-solid-band case the helper fixes.
+    const polls = [];
+    for (let i = 0; i < 10; i++) polls.push({ start: i * 100, end: i * 100 + 1 });
+    const cov = pixelCoverage(polls, 0, 0, 1000, 10);
+    for (let i = 0; i < cov.length; i++) {
+      if (cov[i] > 0.05) fail(`coverage: sparse col ${i} should be faint, got ${cov[i]}`);
+      if (cov[i] <= 0) fail(`coverage: sparse col ${i} should be > 0 (one poll present)`);
+    }
+    pass("sparse polls produce faint (≪1) coverage, not a solid band");
+  }
+
+  function testCoverageSpanAcrossColumns() {
+    // Span [5,25) over 100ns/10px (10ns/col): col0 covered [5,10)=0.5,
+    // col1 fully [10,20)=1.0, col2 [20,25)=0.5.
+    const cov = pixelCoverage([{ start: 5, end: 25 }], 0, 0, 100, 10);
+    if (!approx(cov[0], 0.5)) fail(`coverage: col0 expected 0.5, got ${cov[0]}`);
+    if (!approx(cov[1], 1.0)) fail(`coverage: col1 expected 1.0, got ${cov[1]}`);
+    if (!approx(cov[2], 0.5)) fail(`coverage: col2 expected 0.5, got ${cov[2]}`);
+    for (let i = 3; i < 10; i++) if (!approx(cov[i], 0)) fail(`coverage: col ${i} expected 0`);
+    pass("span straddling columns splits coverage proportionally");
+  }
+
+  function testCoverageClampedToView() {
+    // Span extends beyond both edges; only the in-view portion counts and
+    // no value exceeds 1.
+    const cov = pixelCoverage([{ start: -1000, end: 1000 }], 0, 0, 100, 10);
+    for (let i = 0; i < cov.length; i++) {
+      if (cov[i] > 1) fail(`coverage: col ${i} exceeds 1 (${cov[i]})`);
+      if (!approx(cov[i], 1)) fail(`coverage: col ${i} expected ~1, got ${cov[i]}`);
+    }
+    pass("spans wider than the view clamp to ≤1 per column");
+  }
+
+  function testCoverageDegenerate() {
+    if (pixelCoverage([], 0, 0, 100, 10).some(v => v !== 0)) fail("coverage: empty → all zero");
+    if (pixelCoverage([{start:0,end:1}], 0, 0, 0, 10).length !== 0 &&
+        pixelCoverage([{start:0,end:1}], 0, 0, 0, 10).some(v => v !== 0)) fail("coverage: zero viewDur");
+    if (pixelCoverage([{start:0,end:1}], 0, 0, 100, 0).length !== 0) fail("coverage: zero pw → empty");
+    pass("degenerate inputs yield empty/zero coverage");
+  }
+
+  console.log("\nmakeBarCoalescer:");
+  testCoalescerMergesSubPixelRun();
+  testCoalescerBreaksOnColorChange();
+  testCoalescerBreaksOnGap();
+  testCoalescerMinWidth();
+  testCoalescerEmpty();
+  testCoalescerExtendsRunRightEdge();
+
+  function collectRuns(pushFn, minWidth) {
+    const runs = [];
+    const c = makeBarCoalescer((x, w, color) => runs.push({ x, w, color }), minWidth);
+    pushFn(c);
+    c.flush();
+    return runs;
+  }
+
+  function testCoalescerMergesSubPixelRun() {
+    // 50 same-color sub-pixel bars all landing in [10, 11) must collapse to
+    // a single fillRect, not 50 of them.
+    const runs = collectRuns((c) => {
+      for (let i = 0; i < 50; i++) c.push(10, 10.2, "#abc");
+    });
+    if (runs.length !== 1) fail(`coalescer: expected 1 run, got ${runs.length}`);
+    if (runs[0].color !== "#abc") fail("coalescer: wrong color");
+    pass("sub-pixel same-color burst collapses to one rect");
+  }
+
+  function testCoalescerBreaksOnColorChange() {
+    const runs = collectRuns((c) => {
+      c.push(0, 5, "#aaa");
+      c.push(5, 10, "#bbb");
+      c.push(10, 15, "#aaa");
+    });
+    if (runs.length !== 3) fail(`coalescer: expected 3 runs on color change, got ${runs.length}`);
+    if (runs.map(r => r.color).join() !== "#aaa,#bbb,#aaa")
+      fail("coalescer: colors out of order");
+    pass("adjacent bars of different colors stay separate");
+  }
+
+  function testCoalescerBreaksOnGap() {
+    // Same color but a >1px gap between them must NOT merge.
+    const runs = collectRuns((c) => {
+      c.push(0, 5, "#aaa");
+      c.push(20, 25, "#aaa");
+    });
+    if (runs.length !== 2) fail(`coalescer: expected 2 runs across gap, got ${runs.length}`);
+    pass("same-color bars separated by a gap stay separate");
+  }
+
+  function testCoalescerMinWidth() {
+    const runs = collectRuns((c) => c.push(10, 10, "#aaa")); // zero-width bar
+    if (runs.length !== 1) fail("coalescer: expected 1 run");
+    if (runs[0].w !== 1) fail(`coalescer: expected min width 1, got ${runs[0].w}`);
+    const wide = collectRuns((c) => c.push(10, 10, "#aaa"), 3);
+    if (wide[0].w !== 3) fail(`coalescer: expected min width 3, got ${wide[0].w}`);
+    pass("min width enforced for sub-pixel runs");
+  }
+
+  function testCoalescerEmpty() {
+    const runs = collectRuns(() => {});
+    if (runs.length !== 0) fail(`coalescer: expected 0 runs, got ${runs.length}`);
+    pass("no pushes emits nothing");
+  }
+
+  function testCoalescerExtendsRunRightEdge() {
+    // Overlapping/adjacent same-color bars extend the run; the emitted rect
+    // spans the union [0, 30).
+    const runs = collectRuns((c) => {
+      c.push(0, 10, "#aaa");
+      c.push(8, 20, "#aaa");
+      c.push(20, 30, "#aaa");
+    });
+    if (runs.length !== 1) fail(`coalescer: expected 1 merged run, got ${runs.length}`);
+    if (runs[0].x !== 0 || runs[0].w !== 30)
+      fail(`coalescer: expected x=0 w=30, got x=${runs[0].x} w=${runs[0].w}`);
+    pass("contiguous same-color bars merge to their union");
+  }
+
+  console.log("\nanalyzeAllocations:");
+  testAnalyzeAllocationsEmpty();
+  testAnalyzeAllocationsBasicSummary();
+  testAnalyzeAllocationsPerTask();
+  testAnalyzeAllocationsNonWorkerTid();
+  testAnalyzeAllocationsEstimatedBytes();
+  testAnalyzeAllocationsAddressReuse();
+
+  function testAnalyzeAllocationsEmpty() {
+    const r = analyzeAllocations(null, null);
+    if (r.summary.totalAllocCount !== 0) fail("empty: expected 0 allocs");
+    if (r.perTask.size !== 0) fail("empty: expected empty perTask");
+    pass("null inputs produce empty result");
+  }
+
+  function testAnalyzeAllocationsBasicSummary() {
+    const allocs = [
+      { timestamp: 100, tid: 10, size: 1024, addr: "0x1", callchain: ["0xa"] },
+      { timestamp: 200, tid: 10, size: 2048, addr: "0x2", callchain: ["0xa"] },
+    ];
+    const frees = [
+      { timestamp: 300, tid: 10, addr: "0x1", size: 1024, allocTimestampNs: 100 },
+    ];
+    const r = analyzeAllocations(allocs, frees);
+    if (r.summary.totalAllocCount !== 2) fail("basic: expected 2 allocs");
+    if (r.summary.totalFreeCount !== 1) fail("basic: expected 1 free");
+    if (r.summary.leakedCount !== 1) fail("basic: expected 1 leak");
+    if (r.summary.totalAllocBytes !== 3072) fail("basic: expected 3072 bytes");
+    // With default R=524288, small allocs (s<<R) have weight ≈ R each
+    // so estimatedTotalBytes ≈ 2 * 524288 (slightly above due to s/(1-exp(-s/R)) > R)
+    if (Math.abs(r.summary.estimatedTotalBytes - 2 * 524288) > 5000) fail("basic: wrong estimatedTotalBytes");
+    pass("basic summary correct");
+  }
+
+  function testAnalyzeAllocationsPerTask() {
+    // Worker 0 has tid=10, polling task 42 from t=50..500 and task 99 from t=600..900
+    const events = [
+      { eventType: 0, timestamp: 50, workerId: 0, taskId: 42 },
+      { eventType: 0, timestamp: 600, workerId: 0, taskId: 99 },
+    ];
+    const tidToWorker = new Map([[10, 0]]);
+    const allocs = [
+      { timestamp: 100, tid: 10, size: 1024, addr: "0x1", callchain: ["0xa"] },
+      { timestamp: 200, tid: 10, size: 2048, addr: "0x2", callchain: ["0xb"] },
+      { timestamp: 700, tid: 10, size: 512, addr: "0x3", callchain: ["0xc"] },
+    ];
+    const frees = [];
+    const r = analyzeAllocations(allocs, frees, { events, tidToWorker });
+    if (r.perTask.size !== 2) fail(`perTask: expected 2 tasks, got ${r.perTask.size}`);
+    const t42 = r.perTask.get(42);
+    if (!t42) fail("perTask: missing task 42");
+    if (t42.count !== 2) fail(`perTask: task 42 count=${t42.count}, expected 2`);
+    if (t42.sampledBytes !== 3072) fail(`perTask: task 42 sampledBytes=${t42.sampledBytes}`);
+    // estimatedBytes should be > sampledBytes (weight > size for small allocs)
+    if (t42.estimatedBytes <= t42.sampledBytes) fail("perTask: estimatedBytes should exceed sampledBytes for small allocs");
+    const t99 = r.perTask.get(99);
+    if (!t99) fail("perTask: missing task 99");
+    if (t99.count !== 1) fail(`perTask: task 99 count=${t99.count}, expected 1`);
+    pass("per-task attribution correct");
+  }
+
+  function testAnalyzeAllocationsNonWorkerTid() {
+    // Alloc from tid=99 which is not in tidToWorker → should not appear in perTask
+    const events = [
+      { eventType: 0, timestamp: 50, workerId: 0, taskId: 42 },
+    ];
+    const tidToWorker = new Map([[10, 0]]);
+    const allocs = [
+      { timestamp: 100, tid: 99, size: 1024, addr: "0x1", callchain: ["0xa"] },
+    ];
+    const frees = [];
+    const r = analyzeAllocations(allocs, frees, { events, tidToWorker });
+    if (r.perTask.size !== 0) fail("nonWorkerTid: expected empty perTask");
+    pass("non-worker tid allocations excluded from perTask");
+  }
+
+  function testAnalyzeAllocationsEstimatedBytes() {
+    const events = [
+      { eventType: 0, timestamp: 50, workerId: 0, taskId: 7 },
+    ];
+    const tidToWorker = new Map([[10, 0]]);
+    // Use size = sampleRateBytes so weight = s/(1-exp(-1)) ≈ 1.582*s
+    const sampleRateBytes = 1000;
+    const allocs = [
+      { timestamp: 100, tid: 10, size: 1000, addr: "0x1", callchain: [] },
+      { timestamp: 200, tid: 10, size: 1000, addr: "0x2", callchain: [] },
+      { timestamp: 300, tid: 10, size: 1000, addr: "0x3", callchain: [] },
+    ];
+    const r = analyzeAllocations(allocs, [], { events, tidToWorker, sampleRateBytes });
+    const t7 = r.perTask.get(7);
+    if (!t7) fail("estimated: missing task 7");
+    // weight(1000) = 1000 / (1 - exp(-1)) ≈ 1581.98
+    const expectedPerSample = 1000 / (1 - Math.exp(-1));
+    if (Math.abs(t7.estimatedBytes - 3 * expectedPerSample) > 1) fail(`estimated: expected ~${3*expectedPerSample}, got ${t7.estimatedBytes}`);
+    if (r.sampleRateBytes !== 1000) fail("estimated: sampleRateBytes not returned");
+    // For s >> R, weight ≈ s (large allocs represent themselves)
+    const bigAllocs = [{ timestamp: 100, tid: 10, size: 100000, addr: "0x1", callchain: [] }];
+    const r2 = analyzeAllocations(bigAllocs, [], { events, tidToWorker, sampleRateBytes });
+    const t7b = r2.perTask.get(7);
+    if (Math.abs(t7b.estimatedBytes - 100000) > 10) fail(`large alloc: weight should ≈ size, got ${t7b.estimatedBytes}`);
+    pass("weight(s) = s / (1 - exp(-s/R)) applied correctly");
+  }
+
+  function testAnalyzeAllocationsAddressReuse() {
+    // Two allocs at the same address (reuse after free). Only the first is freed.
+    const allocs = [
+      { timestamp: 100, tid: 10, size: 1024, addr: "0x1", callchain: ["0xa"] },
+      { timestamp: 300, tid: 10, size: 2048, addr: "0x1", callchain: ["0xa"] }, // reused addr
+    ];
+    const frees = [
+      { timestamp: 200, tid: 10, addr: "0x1", size: 1024, allocTimestampNs: 100 }, // frees first alloc only
+    ];
+    const r = analyzeAllocations(allocs, frees);
+    if (r.summary.leakedCount !== 1) fail(`addressReuse: expected 1 leak, got ${r.summary.leakedCount}`);
+    if (r.leaks.length !== 1) fail(`addressReuse: expected 1 leak entry, got ${r.leaks.length}`);
+    if (r.leaks[0].timestamp !== 300) fail(`addressReuse: leaked alloc should be the second one (t=300)`);
+    pass("address reuse: only the matching alloc is considered freed");
+  }
+
+  console.log("\nheap flamegraph from alloc events:");
+  testHeapFlamegraphFromAllocEvents();
+  testHeapFlamegraphEmptyCallchains();
+
+  function testHeapFlamegraphFromAllocEvents() {
+    // Simulate the viewer's heap flamegraph: convert alloc events to samples
+    // and build a flamegraph tree from them.
+    const allocEvents = [
+      { timestamp: 100, tid: 10, size: 1024, addr: "0x1", callchain: ["0xaaa", "0xbbb", "0xccc"] },
+      { timestamp: 200, tid: 10, size: 2048, addr: "0x2", callchain: ["0xaaa", "0xbbb", "0xddd"] },
+      { timestamp: 300, tid: 10, size: 512, addr: "0x3", callchain: ["0xaaa", "0xeee"] },
+    ];
+    const samples = allocEvents
+      .filter(a => a.callchain.length > 0)
+      .map(a => ({ callchain: a.callchain, workerId: 0 }));
+    const symbols = new Map(); // no symbols — raw addresses used as names
+    const tree = buildFlamegraphTree(samples, symbols);
+    if (tree.count !== 3) fail(`heapFg: root count should be 3, got ${tree.count}`);
+    // All samples share "0xaaa" as the bottom frame (reversed: it becomes the first child)
+    // buildFlamegraphTree reverses callchains, so 0xccc/0xddd/0xeee are at the bottom
+    // and 0xaaa is at the top of the tree
+    if (!tree.children.has("0xccc") && !tree.children.has("0xaaa")) {
+      // The tree reverses callchains, so the deepest frame becomes the root child
+      fail("heapFg: expected reversed callchain structure in tree");
+    }
+    const flat = flattenFlamegraph(tree, tree.count);
+    if (flat.nodes.length === 0) fail("heapFg: flattenFlamegraph produced no nodes");
+    if (flat.maxDepth < 1) fail("heapFg: expected depth > 0");
+    pass("alloc events produce valid flamegraph tree");
+  }
+
+  function testHeapFlamegraphEmptyCallchains() {
+    // Alloc events with empty callchains should be filtered out
+    const allocEvents = [
+      { timestamp: 100, tid: 10, size: 1024, addr: "0x1", callchain: [] },
+      { timestamp: 200, tid: 10, size: 2048, addr: "0x2", callchain: ["0xaaa"] },
+    ];
+    const samples = allocEvents
+      .filter(a => a.callchain.length > 0)
+      .map(a => ({ callchain: a.callchain, workerId: 0 }));
+    if (samples.length !== 1) fail(`heapFgEmpty: expected 1 sample after filter, got ${samples.length}`);
+    const tree = buildFlamegraphTree(samples, new Map());
+    if (tree.count !== 1) fail(`heapFgEmpty: root count should be 1, got ${tree.count}`);
+    pass("empty callchains filtered out correctly");
+  }
 
   console.log("\n✓ All analysis checks passed!");
 }

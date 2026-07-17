@@ -54,16 +54,20 @@ fn symbols() -> Option<&'static Symbols> {
         .get_or_init(|| {
             // SAFETY: `dlsym(RTLD_DEFAULT, ...)` is an async-signal-safe FFI
             // lookup; we transmute only when the returned pointer is non-null.
-            let add = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"AddSpecialSignalHandlerFn".as_ptr()) };
-            let remove =
-                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"RemoveSpecialSignalHandlerFn".as_ptr()) };
+            let add =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"AddSpecialSignalHandlerFn".as_ptr()) };
+            let remove = unsafe {
+                libc::dlsym(libc::RTLD_DEFAULT, c"RemoveSpecialSignalHandlerFn".as_ptr())
+            };
             if add.is_null() || remove.is_null() {
                 return None;
             }
             // SAFETY: non-null dlsym results pointing at libsigchain symbols of
             // the documented C signatures.
             Some(Symbols {
-                add: unsafe { core::mem::transmute::<*mut c_void, AddSpecialSignalHandlerFnPtr>(add) },
+                add: unsafe {
+                    core::mem::transmute::<*mut c_void, AddSpecialSignalHandlerFnPtr>(add)
+                },
                 remove: unsafe {
                     core::mem::transmute::<*mut c_void, RemoveSpecialSignalHandlerFnPtr>(remove)
                 },

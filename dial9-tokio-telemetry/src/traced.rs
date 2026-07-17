@@ -1,6 +1,7 @@
 //! Future wrappers for task instrumentation.
 
 use crate::rate_limit::rate_limited;
+use crate::telemetry::format::WakeEventEvent;
 use crate::telemetry::recorder::SharedState;
 use crate::telemetry::task_metadata::TaskId;
 use futures_util::task::{ArcWake, AtomicWaker, waker as arc_waker};
@@ -130,9 +131,13 @@ fn record_wake_event(data: &TracedWakerData) {
         } else {
             255
         };
-        let event = data
-            .shared
-            .create_wake_event(data.woken_task_id, waking_worker_u8);
+        let waker_task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
+        let event = WakeEventEvent {
+            timestamp_ns: crate::telemetry::events::clock_monotonic_ns(),
+            waker_task_id,
+            woken_task_id: data.woken_task_id,
+            target_worker: waking_worker_u8,
+        };
         buf.record_encodable_event(&event);
     });
 }
@@ -222,11 +227,11 @@ impl<F: Future> Future for WakeTraced<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::buffer;
-    use crate::telemetry::events::TelemetryEvent;
+    use crate::telemetry::analysis_events::Dial9Event;
     use crate::telemetry::recorder::{TelemetryCore, TracedRuntime};
     use crate::telemetry::task_metadata::UNKNOWN_TASK_ID;
-    use crate::telemetry::writer::{NullWriter, RotatingWriter};
+    use crate::telemetry::writer::{DiskWriter, InMemoryWriter};
+    use dial9_core::test_util;
     use futures_util::task::noop_waker;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -235,10 +240,11 @@ mod tests {
 
     #[test]
     fn traced_future_falls_back_after_missing_task_context() {
-        let guard = TelemetryCore::builder().writer(NullWriter).build().unwrap();
-        let handle = guard
-            .handle()
-            .traced_handle()
+        let guard = TelemetryCore::builder()
+            .writer(InMemoryWriter::new(16 * 1024 * 1024).unwrap())
+            .build()
+            .unwrap();
+        let handle = crate::telemetry::recorder::traced_handle(&guard.handle())
             .expect("enabled handle yields TracedHandle");
 
         let mut future = TracedFuture::new(std::future::pending::<()>(), Some(handle));
@@ -265,7 +271,7 @@ mod tests {
     /// matches the spawned task when a `Notify` wakes it.
     ///
     /// This is an integration test: events are written to a real file via
-    /// `RotatingWriter` and then read back with `TraceReader`.
+    /// `DiskWriter` and then read back with `TraceReader`.
     #[test]
     #[cfg(feature = "analysis")]
     fn traced_emits_wake_events() {
@@ -277,11 +283,11 @@ mod tests {
         // BUFFER accesses — share a single thread with the test itself.
         let (runtime, guard) = TracedRuntime::build_and_start(
             tokio::runtime::Builder::new_current_thread(),
-            RotatingWriter::single_file(&trace_path).unwrap(),
+            DiskWriter::single_file(&trace_path).unwrap(),
         )
         .unwrap();
 
-        let handle = guard.handle();
+        let handle = guard.tokio_handle(runtime.handle());
         let notify = Arc::new(tokio::sync::Notify::new());
         let notify_clone = notify.clone();
 
@@ -312,13 +318,12 @@ mod tests {
         // Wake events land in the thread-local buffer (capacity 1_024), so a
         // single event will not auto-flush.  Manually drain the buffer into the
         // collector so that the guard flush below picks it up.
-        let th = handle
-            .traced_handle()
+        let th = crate::telemetry::recorder::traced_handle(&guard.handle())
             .expect("enabled handle yields TracedHandle");
-        buffer::drain_to_collector(&th.shared.collector);
+        test_util::drain_thread_local(&th.shared);
 
         // Dropping the guard stops the background flush thread, joins it, then
-        // performs a final flush: collector → RotatingWriter → trace file.
+        // performs a final flush: collector → DiskWriter → trace file.
         drop(guard);
 
         // Parse the trace file and collect all WakeEvents.
@@ -330,8 +335,8 @@ mod tests {
         let wake_task_ids: Vec<TaskId> = events
             .iter()
             .filter_map(|e| {
-                if let TelemetryEvent::WakeEvent { woken_task_id, .. } = e {
-                    Some(*woken_task_id)
+                if let Dial9Event::WakeEvent(w) = e {
+                    Some(TaskId(w.woken_task_id))
                 } else {
                     None
                 }

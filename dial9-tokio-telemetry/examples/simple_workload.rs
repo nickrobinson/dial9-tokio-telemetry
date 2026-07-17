@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use dial9_tokio_telemetry::Dial9Config;
-use dial9_tokio_telemetry::telemetry::TelemetryHandle;
+use dial9_tokio_telemetry::telemetry::Dial9TokioHandle;
 
 async fn cpu_work(iterations: u64) -> u64 {
     let mut result = 0u64;
@@ -41,7 +41,7 @@ async fn mixed_task(id: usize) {
 
 #[dial9_tokio_telemetry::main(config = || {
     Dial9Config::builder()
-        .base_path("simple_workload_trace.bin")
+        .on_disk_buffer("simple_workload_trace.bin")
         .max_file_size(64 * 1024 * 1024)
         .max_total_size(256 * 1024 * 1024)
         .with_tokio(|t| { t.worker_threads(4); })
@@ -51,7 +51,7 @@ async fn mixed_task(id: usize) {
 async fn main() {
     println!("Running workload...");
 
-    let handle = TelemetryHandle::current();
+    let handle = Dial9TokioHandle::current();
     let tasks: Vec<_> = (0..200).map(|i| handle.spawn(mixed_task(i))).collect();
 
     for task in tasks {

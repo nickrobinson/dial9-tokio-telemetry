@@ -7,6 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Explicit CPU profiling backend selection via `CpuProfilingConfig::with_perf_backend()` and `CpuProfilingConfig::with_ctimer_backend()` constructors. The default (Auto: try perf, fall back to ctimer) is unchanged ([#579](https://github.com/dial9-rs/dial9/issues/579), [#660](https://github.com/dial9-rs/dial9/pull/660))
+- In-memory writer (`InMemoryWriter`): run the trace pipeline with no filesystem dependency, encoded segments are held in process memory and shipped by the existing processor pipeline ([#435](https://github.com/dial9-rs/dial9/pull/435))
+- `#[dial9_tokio_telemetry::main]` now performs an implicit graceful shutdown after the async body returns: it drops the runtime and drains the background worker so the final segment is symbolized, compressed, and uploaded. Configure the deadline with `Dial9Config::builder()...graceful_shutdown(Duration)` (default 1s) or skip it with `.disable_graceful_shutdown()`. The low-level `TracedRuntime` API is unchanged — call `TelemetryGuard::graceful_shutdown` yourself ([#479](https://github.com/dial9-rs/dial9/issues/479))
+- `SegmentProcessor::finalize_dump`: custom processors can flush per-dump state when an on-demand dump completes ([#549](https://github.com/dial9-rs/dial9/pull/549))
+- `ProcessError::into_parts`: destructure a processing error into its kind and the carried segment data ([#549](https://github.com/dial9-rs/dial9/pull/549))
+- Memory profiling can run standalone, without `dial9-core`: depend on `dial9-perf-self-profile` with the `memory-profiling` feature, set `SamplingAllocator` as the global allocator, call `MemoryProfiler::install()`, and drain `MemorySample`s via `MemorySampler::drain`. The dial9 trace integration is that crate's `dial9-source` feature.
+
+### Changed
+
+- Programs using `#[dial9_tokio_telemetry::main]` with the fluent `Dial9Config` now drain the telemetry worker on clean exit (up to the graceful-shutdown deadline, default 1s) instead of exiting immediately. This adds a bounded amount of shutdown latency but ensures the final segment is processed; opt out with `.disable_graceful_shutdown()`. The deprecated positional config is unaffected ([#479](https://github.com/dial9-rs/dial9/issues/479))
+- **Breaking:** renamed `RotatingWriter` to `DiskWriter`. The writer is now generic over its storage backend (`SegmentWriter<Mode>`) with `DiskWriter` / `InMemoryWriter` as the public types; memory constructors are `InMemoryWriter::new` / `::builder` ([#435](https://github.com/dial9-rs/dial9/pull/435))
+- **Breaking:** `SegmentData::segment()` returns `&SegmentRef` (disk- or memory-backed) instead of `&SealedSegment`; processors that read the segment path must match the enum ([#435](https://github.com/dial9-rs/dial9/pull/435))
+- **Breaking:** collapsed the handle types into `Dial9Handle` (record/control, runtime-agnostic) and `Dial9TokioHandle` (spawn only). `TelemetryHandle` and `RuntimeTelemetryHandle` are removed ([#535](https://github.com/dial9-rs/dial9/pull/535))
+- **Breaking:** recording is now a method: `record_event(event, &handle)` becomes `handle.record_event(event)` ([#535](https://github.com/dial9-rs/dial9/pull/535))
+- **Breaking:** `guard.handle()` now returns `Dial9Handle` (record/control). To spawn instrumented tasks use `Dial9TokioHandle::current()`, `guard.tokio_handle(&runtime)`, or the handle from `trace_runtime().build()` ([#535](https://github.com/dial9-rs/dial9/pull/535))
+- **Breaking:** `boot_id` is no longer an `S3Config` builder field. The runtime injects the on-disk namespace `boot_id` into the S3 config at build time, so a local trace segment and its S3 key share one identity. An `S3Config` built outside the managed `Dial9Config` path falls back to a fresh `{4-alpha}-{pid}` ([#566](https://github.com/dial9-rs/dial9/pull/566))
+- Memory profiling moved into `dial9-perf-self-profile`. The `dial9_tokio_telemetry::memory_profiling::*` paths are preserved by re-export, so most code is unaffected.
+- **Breaking:** `MemoryProfiler::install` no longer takes a `Dial9Handle`, it returns a `MemorySampler` for standalone draining. For the dial9 trace integration use `MemoryProfiler::install_into(&handle)` ([#591](https://github.com/dial9-rs/dial9/pull/591))
+- **Breaking:** removed `MemoryProfilerGuard`. Memory profiling now drains for the session/guard lifetime (like CPU profiling) rather than being a permanent process-wide install ([#591](https://github.com/dial9-rs/dial9/pull/591))
+- **Breaking:** renamed `Dial9Allocator` to `SamplingAllocator`, the global-allocator wrapper now lives in `dial9-perf-self-profile` and works without dial9 ([#591](https://github.com/dial9-rs/dial9/pull/591))
+
+### Fixed
+
+- Viewer: browsing a nonexistent bucket now returns HTTP 404 instead of 500, and a syntactically invalid bucket name returns HTTP 400. The S3 `NoSuchBucket`/`NoSuchKey` and `InvalidBucketName` error codes were falling through to the generic error arm, which logged an "unclassified S3 error" and reported a server `fault` — so a user typo in the bucket name polluted the viewer's fault metric. They now classify as `NotFound` (404) and `BadRequest` (400) respectively.
+
+## [0.3.13](https://github.com/dial9-rs/dial9/compare/dial9-tokio-telemetry-v0.3.12...dial9-tokio-telemetry-v0.3.13) - 2026-05-29
+
+### Added
+
+- Add resource usage events to trace (rss, page faults etc.) ([#470](https://github.com/dial9-rs/dial9/pull/470))
+
+## [0.3.12](https://github.com/dial9-rs/dial9/compare/dial9-tokio-telemetry-v0.3.11...dial9-tokio-telemetry-v0.3.12) - 2026-05-28
+
+This release adds **memory profiling** and **CPU-profiler-only mode**.
+
+### Memory Profiling ([#442](https://github.com/dial9-rs/dial9/pull/442), [#443](https://github.com/dial9-rs/dial9/pull/443), [#452](https://github.com/dial9-rs/dial9/pull/452), [#459](https://github.com/dial9-rs/dial9/pull/459))
+
+dial9 can now sample heap allocations and produce allocation flamegraphs. With liveset tracking enabled, you can see which allocations are never freed.
+
+```rust
+use dial9_tokio_telemetry::memory_profiling::{
+    Dial9Allocator, MemoryProfiler, MemoryProfilingConfig,
+};
+
+#[global_allocator]
+static ALLOC: Dial9Allocator = Dial9Allocator::system();
+
+let config = MemoryProfilingConfig::builder()
+    .sample_rate_bytes(512 * 1024)  // sample ~every 512 KiB allocated
+    .track_liveset(true)            // track frees for leak detection
+    .build();
+
+let _guard = MemoryProfiler::from_config(config)
+    .install(handle)
+    .expect("failed to install memory profiler");
+```
+
+The viewer includes a new **heap flamegraph** tab with toggleable bytes/count views. The trace emits `MemoryProfileOverflowEvent` when ring buffers overflow so you know when leak counts may be inflated.
+
+### CPU Profiler Only Mode ([#454](https://github.com/dial9-rs/dial9/pull/454))
+
+dial9 can now be used purely as a CPU profiler without Tokio runtime hooks. Useful for non-Tokio applications or when you only need flamegraphs:
+
+```rust
+let (runtime, guard) = TracedRuntime::builder()
+    .with_cpu_profiling(CpuProfilingConfig::default())
+    .with_tokio_instrumentation(false)
+    .build_and_start(tokio::runtime::Builder::new_multi_thread(), writer)?;
+```
+
+Or via environment variables:
+
+```text
+DIAL9_ENABLED=true
+DIAL9_CPU_PROFILE_ENABLED=true
+DIAL9_TOKIO_INSTRUMENTATION_ENABLED=false
+```
+
+### Setup Diagnostics Skill ([#464](https://github.com/dial9-rs/dial9/pull/464))
+
+The agent toolkit now runs setup diagnostics before analysis, detecting missing frame pointers, uninstrumented tasks, stripped debug symbols, and disabled scheduling events. When detected, it provides instructions to fix:
+
+```
+🔴 [missing-frame-pointers] CPU stack traces are only 1.4 frames deep on average (expected 10+).
+
+  Fix: Add to .cargo/config.toml:
+  [build]
+  rustflags = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
+
+🟡 [missing-wake-events] 50 tasks spawned but 0 wake events recorded.
+
+  Fix: Use TelemetryHandle::spawn() instead of tokio::spawn()
+```
+
+### Other Changes
+
+- *(tokio-telemetry)* Add `Deserialize` to built-in event structs ([#451](https://github.com/dial9-rs/dial9/pull/451), [#447](https://github.com/dial9-rs/dial9/pull/447))
+- *(viewer)* Continuous log-scale poll color heatmap replaces the old 4-bucket scheme ([#453](https://github.com/dial9-rs/dial9/pull/453))
+- `max_file_size` is now optional in `Dial9Config` — defaults to `min(100 MiB, max_total_size / 4)` ([#456](https://github.com/dial9-rs/dial9/pull/456))
+- Rotation period is now measured monotonically, removing wallclock-time edge cases ([#461](https://github.com/dial9-rs/dial9/pull/461))
+- Trace metadata now includes `dial9.version` for debugging version mismatches ([#463](https://github.com/dial9-rs/dial9/pull/463))
+- Viewer: allow empty prefix when searching S3 buckets ([#460](https://github.com/dial9-rs/dial9/pull/460))
+
+## [0.3.11](https://github.com/dial9-rs/dial9/compare/dial9-tokio-telemetry-v0.3.10...dial9-tokio-telemetry-v0.3.11) - 2026-05-22
+
+### Added
+
+- Users can now provide their own Tokio runtime hooks which compose with dial9's. ([#297](https://github.com/dial9-rs/dial9/pull/297)) ([#439](https://github.com/dial9-rs/dial9/pull/439))
+- Clients can now be configured with `from_env`, a standard set of environment variables to configure clients ([#406](https://github.com/dial9-rs/dial9/pull/406))
+- *(viewer)* add custom events view ([#438](https://github.com/dial9-rs/dial9/pull/438))
+
+### Fixed
+
+- `block_in_place` no longer causes nonsense data in trace files: detect block_in_place gaps and correct CPU sample worker attribution ([#436](https://github.com/dial9-rs/dial9/pull/436))
+- enforce RotatingWriter retention across restarts ([#414](https://github.com/dial9-rs/dial9/pull/414))
+- *(viewer)* correct KSD navigation time calculation ([#422](https://github.com/dial9-rs/dial9/pull/422)) ([#432](https://github.com/dial9-rs/dial9/pull/432))
+
+### Other
+
+- refactor: inline EventWriter, delete the shallow wrapper ([#434](https://github.com/dial9-rs/dial9/pull/434))
+- refactor: split recorder/mod.rs into focused modules ([#433](https://github.com/dial9-rs/dial9/pull/433))
+- extract sampling primitives into shared module ([#418](https://github.com/dial9-rs/dial9/pull/418))
+- Extract Source trait for flush-thread data sources ([#408](https://github.com/dial9-rs/dial9/pull/408))
+- *(design)* in-memory pipeline ([#389](https://github.com/dial9-rs/dial9/pull/389))
+- Add connection-established / closed events to the demo trace ([#441](https://github.com/dial9-rs/dial9/pull/441))
+
 ## [0.3.10](https://github.com/dial9-rs/dial9/compare/dial9-tokio-telemetry-v0.3.9...dial9-tokio-telemetry-v0.3.10) - 2026-05-15
 
 ### Added

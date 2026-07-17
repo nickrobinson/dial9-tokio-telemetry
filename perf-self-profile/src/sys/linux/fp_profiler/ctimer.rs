@@ -28,7 +28,9 @@ use std::io;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
+use crate::rate_limit::rate_limited;
 use crate::sys::linux::gettid;
 
 use libc::{timer_create, timer_delete, timer_settime};
@@ -172,9 +174,11 @@ pub fn register_thread() -> Result<(), io::Error> {
         // SAFETY: same `timerid`, valid to delete after a failed `timer_settime`.
         if unsafe { timer_delete(timerid) } != 0 {
             let cleanup_err = io::Error::last_os_error();
-            tracing::warn!(
-                "ctimer: timer_delete after timer_settime failure failed: {cleanup_err}"
-            );
+            rate_limited!(Duration::from_secs(60), {
+                tracing::warn!(
+                    "ctimer: timer_delete after timer_settime failure failed: {cleanup_err}"
+                );
+            });
         }
         return Err(err);
     }
@@ -195,12 +199,18 @@ pub fn unregister_thread() {
             // `old_value` is null (allowed).
             if unsafe { timer_settime(t, 0, &zero, ptr::null_mut()) } != 0 {
                 let err = io::Error::last_os_error();
-                tracing::warn!("ctimer: timer_settime(disarm) failed in unregister_thread: {err}");
+                rate_limited!(Duration::from_secs(60), {
+                    tracing::warn!(
+                        "ctimer: timer_settime(disarm) failed in unregister_thread: {err}"
+                    );
+                });
             }
             // SAFETY: `t` is still valid until `timer_delete` succeeds.
             if unsafe { timer_delete(t) } != 0 {
                 let err = io::Error::last_os_error();
-                tracing::warn!("ctimer: timer_delete failed in unregister_thread: {err}");
+                rate_limited!(Duration::from_secs(60), {
+                    tracing::warn!("ctimer: timer_delete failed in unregister_thread: {err}");
+                });
             }
         }
     });
@@ -247,13 +257,6 @@ mod tests {
 
     static SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    // `timer_getoverrun` is POSIX but not exposed in libc as a direct fn; declare it.
-    // It is async-signal-safe and returns the number of *additional* expirations
-    // that occurred between the previous signal delivery and this one.
-    unsafe extern "C" {
-        fn timer_getoverrun(timerid: libc::timer_t) -> libc::c_int;
-    }
-
     /// Counting handler that accounts for timer coalescing.
     ///
     /// On kernels with low `CONFIG_HZ` (e.g. 100) and/or when the process is
@@ -266,7 +269,7 @@ mod tests {
         let overruns = current_thread_timer_id()
             // SAFETY: `timer_getoverrun` is POSIX async-signal-safe; `t` is this
             // thread's live timer handle.
-            .map(|t| unsafe { timer_getoverrun(t) }.max(0) as u64)
+            .map(|t| unsafe { libc::timer_getoverrun(t) }.max(0) as u64)
             .unwrap_or(0);
         SAMPLE_COUNT.fetch_add(1 + overruns, Ordering::Relaxed);
     }

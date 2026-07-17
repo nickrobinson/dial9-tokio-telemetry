@@ -12,7 +12,7 @@
 
 use clap::Parser;
 use dial9_tokio_telemetry::background_task::s3::S3Config;
-use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::{DiskWriter, TracedRuntime};
 use metrique::local::{LocalFormat, OutputStyle};
 use metrique::writer::format::FormatExt;
 use metrique::writer::sink::FlushImmediatelyBuilder;
@@ -124,7 +124,7 @@ fn main() -> std::io::Result<()> {
 
     std::fs::create_dir_all(&trace_dir)?;
 
-    let writer = RotatingWriter::new(&args.trace_path, args.segment_size, args.total_size)?;
+    let writer = DiskWriter::new(&args.trace_path, args.segment_size, args.total_size)?;
 
     let s3_config = S3Config::builder()
         .bucket(&args.bucket)
@@ -136,7 +136,6 @@ fn main() -> std::io::Result<()> {
                 .to_string_lossy()
                 .to_string(),
         )
-        .boot_id(uuid::Uuid::new_v4().to_string())
         .maybe_region(args.region.as_ref())
         .build();
 
@@ -154,7 +153,7 @@ fn main() -> std::io::Result<()> {
         .with_worker_metrics_sink(metrics_sink)
         .build_and_start(builder, writer)?;
 
-    let handle = guard.handle();
+    let handle = guard.tokio_handle(runtime.handle());
     let load_duration = Duration::from_secs(args.duration);
     let tasks_done = Arc::new(AtomicU64::new(0));
     let start = Instant::now();

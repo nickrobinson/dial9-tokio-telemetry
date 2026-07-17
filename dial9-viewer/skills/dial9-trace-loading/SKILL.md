@@ -16,6 +16,8 @@ description: Parse and load dial9 Tokio runtime trace files. Covers the ParsedTr
   events: TraceEvent[],          // PollStart, PollEnd, WorkerPark, WorkerUnpark, QueueSample, WakeEvent
   minTs: number|null,            // earliest event timestamp (ns), null if no events
   maxTs: number|null,            // latest event timestamp (ns), null if no events
+  recordMinTs: number|null,      // earliest sliceable timestamped record (ns), null if none
+  recordMaxTs: number|null,      // latest sliceable timestamped record (ns), null if none
   cpuSamples: CpuSample[],      // Periodic stack traces from perf/eBPF
   customEvents: CustomEvent[],   // SpanEnter/SpanExit events from tracing layer (requires dial9-tokio-telemetry tracing-layer feature)
   spawnLocations: Map<string, string>,    // spawn location ID → source location
@@ -27,6 +29,7 @@ description: Parse and load dial9 Tokio runtime trace files. Covers the ParsedTr
   clockOffsetNs: number|null,            // monotonic-to-wall-clock offset
   clockSyncAnchors: [{monotonicNs, realtimeNs}],
   runtimeWorkers: Map<string, number[]>, // runtime name → worker IDs
+  segmentMetadata: Map<string, string>,  // latest segment metadata key → value
   truncated: boolean,
   timeFiltered: boolean,
   filterStartTime: number|null,          // start of time range filter (ns), null if unfiltered
@@ -38,6 +41,9 @@ description: Parse and load dial9 Tokio runtime trace files. Covers the ParsedTr
   taskDumps: Map<number, [{timestamp, callchain}]>, // task ID → async stack captures (sorted by timestamp); see dial9-tokio-telemetry `taskdump` feature
   allocEvents: AllocEvent[],     // Sampled memory allocations (requires dial9-tokio-telemetry memory-profiling feature)
   freeEvents: FreeEvent[],       // Deallocations paired with sampled allocs (requires `track_liveset`)
+  memoryOverflows: [{timestamp, droppedAllocs, droppedFrees}], // Ring buffer overflow events (dropped samples per flush period)
+  blockInPlaceGaps: [{workerId, fromTid, toTid, startNs, endNs}], // Detected block_in_place handoff intervals (worker attribution unknowable during gap)
+  tidToWorker: Map<number, number>,  // thread ID → worker ID mapping (derived from park/unpark events)
 }
 ```
 
@@ -154,12 +160,13 @@ const groups = deduplicateSamples(trace.cpuSamples, trace.callframeSymbols);
 Start the viewer (`dial9-viewer --bucket BUCKET`, default port 3000), then fetch traces:
 
 ```javascript
-// List traces matching a prefix
-const resp = await fetch('http://localhost:3000/api/search?bucket=BUCKET&q=2026-04-09/19');
-const objects = await resp.json(); // [{key, size, last_modified}, ...]
+// List traces in a time range
+const resp = await fetch('http://localhost:3000/api/browse?bucket=BUCKET&prefix=2026-04-09/19&from=0&to=' + Math.floor(Date.now()/1000));
+const objects = (await resp.json()).objects; // [{key, size, last_modified}, ...]
 
-// Single file: fetch and parse one trace
-const traceResp = await fetch(`http://localhost:3000/api/trace?bucket=BUCKET&keys=${encodeURIComponent(objects[0].key)}`);
+// Single file: fetch and parse one trace. /api/object serves the file's raw
+// (still-gzipped) bytes; parseTrace decompresses transparently.
+const traceResp = await fetch(`http://localhost:3000/api/object?bucket=BUCKET&key=${encodeURIComponent(objects[0].key)}`);
 const buf = Buffer.from(await traceResp.arrayBuffer());
 const trace = await parseTrace(buf);
 
@@ -171,7 +178,7 @@ fs.mkdirSync(dir, { recursive: true });
 const limit = 20;
 for (let i = 0; i < objects.length; i += limit) {
   await Promise.all(objects.slice(i, i + limit).map(async (obj) => {
-    const r = await fetch(`http://localhost:3000/api/trace?bucket=BUCKET&keys=${encodeURIComponent(obj.key)}`);
+    const r = await fetch(`http://localhost:3000/api/object?bucket=BUCKET&key=${encodeURIComponent(obj.key)}`);
     fs.writeFileSync(`${dir}/${obj.key.split('/').pop()}`, Buffer.from(await r.arrayBuffer()));
   }));
 }

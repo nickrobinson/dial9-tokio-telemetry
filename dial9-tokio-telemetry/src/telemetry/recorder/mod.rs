@@ -1,52 +1,74 @@
 mod builder;
-mod event_writer;
-mod flush_loop;
 mod guard;
 mod handle;
 mod runtime_context;
-mod shared_state;
-pub(crate) mod source;
+pub(crate) use dial9_core::shared_state::SharedState;
+pub(crate) use dial9_core::source;
 
 pub(crate) use runtime_context::RuntimeContext;
 pub use runtime_context::current_worker_id;
+#[cfg(any(test, feature = "taskdump"))]
 pub(crate) use runtime_context::poll_start_ts_monotonic;
-pub(crate) use shared_state::SharedState;
 
 pub use builder::{
-    HasTracePath, NoTracePath, PipelineCustom, PipelineS3, PipelineUnset, TelemetryCore,
-    TelemetryCoreBuilder, TelemetryRuntimeError, TracedRuntime, TracedRuntimeBuilder,
+    BuildAndStartRuntime, HasTracePath, NoTracePath, PipelineCustom, PipelineS3, PipelineUnset,
+    TelemetryCore, TelemetryCoreBuilder, TelemetryRuntimeError, TracedRuntime,
+    TracedRuntimeBuilder,
 };
+pub use dial9_core::handle::Dial9Handle;
 pub use guard::{TelemetryGuard, TraceRuntimeCoreBuilder};
-pub use handle::{RuntimeTelemetryHandle, TelemetryHandle, spawn};
+pub(crate) use handle::traced_handle;
+pub use handle::{Dial9TokioHandle, spawn};
 
-pub(crate) use flush_loop::FlushStats;
+mod tokio_hooks;
+pub use tokio_hooks::TokioHooks;
 
 // Re-exports for internal test access
-#[cfg(test)]
+#[cfg(all(test, not(shuttle)))]
 use builder::PipelineConfig;
-#[cfg(test)]
-use event_writer::EventWriter;
-#[cfg(test)]
+#[cfg(all(test, not(shuttle)))]
 use handle::InstrumentedSpawnGuard;
 
-use handle::{CURRENT_HANDLE, INSTRUMENTED_SPAWN};
+use dial9_core::handle::{clear_tl_handle, set_tl_handle};
+use handle::INSTRUMENTED_SPAWN;
 use runtime_context::{make_poll_end, make_poll_start, make_worker_park, make_worker_unpark};
 
 use crate::primitives::sync::Arc;
-use crate::primitives::sync::atomic::Ordering;
 use crate::rate_limit::rate_limited;
 use crate::telemetry::format::TaskTerminateEvent;
 use crate::telemetry::task_metadata::TaskId;
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Channel-based control for the flush thread
-// ---------------------------------------------------------------------------
-
-/// Commands sent to the flush thread from TelemetryHandle / TelemetryGuard.
-pub(crate) enum ControlCommand {
-    /// Flush, finalize (seal segment), then exit the thread.
-    FinalizeAndStop(crate::primitives::sync::mpsc::SyncSender<()>),
+/// Register a tokio hook, composing with an optional user callback.
+/// When `$user_hook` is None, registers only the dial9 closure (zero-cost).
+/// When Some, registers a closure that runs dial9 logic first, then the user callbacks.
+macro_rules! register_hook {
+    // For hooks with no arguments: on_thread_park, on_thread_unpark, on_thread_start, on_thread_stop
+    ($builder:expr, $method:ident, $user_hook:expr, $dial9_body:expr) => {
+        if let Some(user_hook) = $user_hook {
+            $builder.$method(move || {
+                $dial9_body;
+                user_hook.execute();
+            });
+        } else {
+            $builder.$method(move || {
+                $dial9_body;
+            });
+        }
+    };
+    // For hooks with a TaskMeta argument: on_before_task_poll, on_after_task_poll, on_task_spawn, on_task_terminate
+    (meta: $builder:expr, $method:ident, $user_hook:expr, |$meta:ident| $dial9_body:expr) => {
+        if let Some(user_hook) = $user_hook {
+            $builder.$method(move |$meta| {
+                $dial9_body;
+                user_hook.execute($meta);
+            });
+        } else {
+            $builder.$method(move |$meta| {
+                $dial9_body;
+            });
+        }
+    };
 }
 
 /// Register telemetry callbacks on a runtime builder.
@@ -64,8 +86,12 @@ fn register_hooks(
     builder: &mut tokio::runtime::Builder,
     ctx: &Arc<RuntimeContext>,
     shared: &Arc<SharedState>,
-    control_tx: &crate::primitives::sync::mpsc::SyncSender<ControlCommand>,
+    handle: &Dial9Handle,
     task_tracking_enabled: bool,
+    tokio_hooks: TokioHooks,
+    #[cfg_attr(not(feature = "taskdump"), allow(unused_variables))] taskdump_config: Option<
+        crate::telemetry::task_dump_config::TaskDumpConfig,
+    >,
 ) {
     // TODO: these should rely on public APIs instead of utilizing `SharedState`
 
@@ -78,37 +104,49 @@ fn register_hooks(
     let c4 = ctx.clone();
     let s4 = shared.clone();
 
-    builder
-        .on_thread_park(move || {
-            s1.if_enabled(|buf| {
-                let event = make_worker_park(&c1, &s1);
-                buf.record_encodable_event(&event);
-            });
+    register_hook!(builder, on_thread_park, tokio_hooks.on_thread_park, {
+        s1.if_enabled(|buf| {
+            let event = make_worker_park(&c1, &s1);
+            buf.record_encodable_event(&event);
         })
-        .on_thread_unpark(move || {
-            s2.if_enabled(|buf| {
-                let event = make_worker_unpark(&c2, &s2);
-                buf.record_encodable_event(&event);
-            });
+    });
+
+    register_hook!(builder, on_thread_unpark, tokio_hooks.on_thread_unpark, {
+        s2.if_enabled(|buf| {
+            let event = make_worker_unpark(&c2, &s2);
+            buf.record_encodable_event(&event);
         })
-        .on_before_task_poll(move |meta| {
+    });
+
+    register_hook!(
+        meta: builder,
+        on_before_task_poll,
+        tokio_hooks.on_before_task_poll,
+        |meta| {
             s3.if_enabled(|buf| {
                 let task_id = TaskId::from(meta.id());
                 let location = meta.spawned_at();
                 let event = make_poll_start(&c3, &s3, location, task_id);
                 buf.record_encodable_event(&event);
-            });
-        })
-        .on_after_task_poll(move |_meta| {
+            })
+        }
+    );
+
+    register_hook!(
+        meta: builder,
+        on_after_task_poll,
+        tokio_hooks.on_after_task_poll,
+        |_meta| {
             s4.if_enabled(|buf| {
                 let event = make_poll_end(&c4, &s4);
                 buf.record_encodable_event(&event);
-            });
-        });
+            })
+        }
+    );
 
     if task_tracking_enabled {
         let s5 = shared.clone();
-        builder.on_task_spawn(move |meta| {
+        register_hook!(meta: builder, on_task_spawn, tokio_hooks.on_task_spawn, |meta| {
             s5.if_enabled(|buf| {
                 let task_id = TaskId::from(meta.id());
                 let location = meta.spawned_at();
@@ -120,110 +158,126 @@ fn register_hooks(
                     location,
                     instrumented,
                 });
-            });
+            })
         });
         let s6 = shared.clone();
-        builder.on_task_terminate(move |meta| {
-            s6.if_enabled(|buf| {
-                let task_id = TaskId::from(meta.id());
-                buf.record_encodable_event(&TaskTerminateEvent {
-                    timestamp_ns: crate::telemetry::events::clock_monotonic_ns(),
-                    task_id,
-                });
+        register_hook!(
+            meta: builder,
+            on_task_terminate,
+            tokio_hooks.on_task_terminate,
+            |meta| {
+                s6.if_enabled(|buf| {
+                    let task_id = TaskId::from(meta.id());
+                    buf.record_encodable_event(&TaskTerminateEvent {
+                        timestamp_ns: crate::telemetry::events::clock_monotonic_ns(),
+                        task_id,
+                    });
+                })
+            }
+        );
+    } else {
+        // When task tracking is disabled, still register user hooks if provided
+        if let Some(user_hook) = tokio_hooks.on_task_spawn {
+            builder.on_task_spawn(move |meta| {
+                user_hook.execute(meta);
             });
-        });
+        }
+        if let Some(user_hook) = tokio_hooks.on_task_terminate {
+            builder.on_task_terminate(move |meta| {
+                user_hook.execute(meta);
+            });
+        }
     }
 
     // Unified on_thread_start / on_thread_stop. Tokio only stores one
     // callback per hook, so any feature-gated work must live here rather
     // than registering its own hook.
-    let handle_for_tl = TelemetryHandle::enabled(shared.clone(), control_tx.clone());
-    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
-    let s_start = shared.clone();
-    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
+    let handle_for_tl = handle.clone();
+    #[cfg(feature = "cpu-profiling")]
     let s_stop = shared.clone();
 
-    builder
-        .on_thread_start(move || {
-            // Install this thread's TelemetryHandle so user code can call
-            // `TelemetryHandle::current()` from anywhere on this thread.
-            CURRENT_HANDLE.with(|cell| {
-                *cell.borrow_mut() = Some(handle_for_tl.clone());
-            });
+    register_hook!(builder, on_thread_start, tokio_hooks.on_thread_start, {
+        // Install this thread's Dial9Handle so user code can call
+        // `Dial9Handle::current()` from anywhere on this thread.
+        set_tl_handle(handle_for_tl.clone());
 
-            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
-            {
-                // Register as Blocking initially; worker threads will
-                // overwrite this to Worker(i) in resolve_worker_id.
-                // NOTE: `tokio::runtime::worker_index()` will always return `None` at this point
-                // so we can't utilize that here.
-                let tid = crate::telemetry::events::current_tid();
-                s_start
-                    .thread_roles
-                    .lock()
-                    .unwrap()
-                    .insert(tid, crate::telemetry::events::ThreadRole::Blocking);
-                // Sched event sampling is deferred to register_tid_if_needed(),
-                // which runs only for worker threads on their first poll/park.
-                // This avoids opening perf fds for blocking pool threads.
+        // Install this thread's task-dump config for `TaskDumped` to read.
+        #[cfg(feature = "taskdump")]
+        if let Some(config) = taskdump_config {
+            crate::task_dumped::set_taskdump_config(config);
+        }
 
-                // Registers the current thread for the CPU-profiling fallback (ctimer).
-                // No-op when perf is the active backend (perf uses inherit).
-                let _ = dial9_perf_self_profile::register_current_thread();
-            }
-        })
-        .on_thread_stop(move || {
-            CURRENT_HANDLE.with(|cell| {
-                *cell.borrow_mut() = None;
-            });
+        #[cfg(feature = "cpu-profiling")]
+        {
+            // Sched event sampling is deferred to start_sched_sampling_if_needed(),
+            // which runs only for worker threads on their first poll/park.
+            // This avoids opening perf fds for blocking pool threads.
 
-            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
-            {
-                let tid = crate::telemetry::events::current_tid();
-                s_stop.thread_roles.lock().unwrap().remove(&tid);
-                if let Ok(mut sources) = s_stop.sources.lock() {
-                    for source in sources.iter_mut() {
-                        source.on_thread_stop();
-                    }
+            // Registers the current thread for the CPU-profiling fallback (ctimer).
+            // No-op when perf is the active backend (perf uses inherit).
+            let _ = dial9_perf_self_profile::register_current_thread();
+        }
+    });
+
+    register_hook!(builder, on_thread_stop, tokio_hooks.on_thread_stop, {
+        clear_tl_handle();
+
+        #[cfg(feature = "taskdump")]
+        crate::task_dumped::clear_taskdump_config();
+
+        #[cfg(feature = "cpu-profiling")]
+        {
+            s_stop.with_sources_mut(|sources| {
+                for source in sources.iter_mut() {
+                    source.on_thread_stop();
                 }
-                dial9_perf_self_profile::unregister_current_thread();
-            }
-        });
+            });
+            dial9_perf_self_profile::unregister_current_thread();
+        }
+    });
 }
 
 /// Attach a runtime to an existing telemetry session: register hooks, build
 /// the runtime, reserve worker IDs, and push the context.
+#[allow(clippy::too_many_arguments)]
 fn attach_runtime(
     shared: &Arc<SharedState>,
+    contexts: &runtime_context::RuntimeContextRegistry,
     mut builder: tokio::runtime::Builder,
     runtime_name: Option<String>,
-    control_tx: &crate::primitives::sync::mpsc::SyncSender<ControlCommand>,
+    handle: &Dial9Handle,
     task_tracking_enabled: bool,
+    tokio_hooks: TokioHooks,
+    taskdump_config: Option<crate::telemetry::task_dump_config::TaskDumpConfig>,
 ) -> std::io::Result<tokio::runtime::Runtime> {
     let ctx = Arc::new(RuntimeContext::new(runtime_name));
     register_hooks(
         &mut builder,
         &ctx,
         shared,
-        control_tx,
+        handle,
         task_tracking_enabled,
+        tokio_hooks,
+        taskdump_config,
     );
 
     let runtime = builder.build()?;
 
     // Install the handle on the calling thread. For current_thread runtimes,
     // this thread IS the worker (block_on runs here), so the tracing layer
-    // needs CURRENT_HANDLE to be set. Harmless for multi_thread runtimes.
-    CURRENT_HANDLE.with(|cell| {
-        *cell.borrow_mut() = Some(TelemetryHandle::enabled(shared.clone(), control_tx.clone()));
-    });
+    // needs the TL handle to be set. Harmless for multi_thread runtimes.
+    set_tl_handle(handle.clone());
+
+    // Same for the task-dump config: on_thread_start skips this thread.
+    #[cfg(feature = "taskdump")]
+    if let Some(config) = taskdump_config {
+        crate::task_dumped::set_taskdump_config(config);
+    }
 
     // Pre-reserve a contiguous block of worker IDs and set metrics atomically.
     let metrics = runtime.handle().metrics();
     let num_workers = metrics.num_workers() as u64;
-    let base = shared
-        .next_worker_id
-        .fetch_add(num_workers, Ordering::Relaxed);
+    let base = shared.reserve_worker_ids(num_workers);
     ctx.metrics_and_base
         .set((metrics, base))
         .unwrap_or_else(|_| {
@@ -244,7 +298,11 @@ fn attach_runtime(
         }
     }
 
-    shared.contexts.lock().unwrap().push(ctx);
+    contexts.lock().unwrap().push(ctx);
+
+    // No need to announce the metadata change: `TokioRuntimesSource` detects the
+    // new runtime (and its eagerly-populated workers) from the runtime/worker
+    // counts on its next flush.
 
     Ok(runtime)
 }
@@ -252,41 +310,15 @@ fn attach_runtime(
 #[cfg(all(test, not(shuttle)))]
 mod tests {
     use super::*;
-    use crate::telemetry::NullWriter;
-    use crate::telemetry::buffer;
-    use crate::telemetry::collector::CentralCollector;
-    use crate::telemetry::writer::RotatingWriter;
+    use crate::background_task::testutil::{CapturingProcessor, decode_captured};
+    use crate::telemetry::writer::InMemoryWriter;
+    use dial9_core::test_util;
     use std::panic::Location;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Drain all pending batches from a `CentralCollector` into an `EventWriter`.
-    /// Call `buffer::drain_to_collector` first to flush the thread-local buffer.
-    fn drain_collector_to_writer(collector: &CentralCollector, ew: &mut EventWriter) {
-        while let Some(batch) = collector.next() {
-            if batch.event_count > 0 {
-                ew.write_encoded_batch(&batch).unwrap();
-            }
-        }
-    }
-
-    /// Writer that captures encoded bytes for test assertions.
-    struct CapturingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl crate::telemetry::writer::TraceWriter for CapturingWriter {
-        fn write_encoded_batch(
-            &mut self,
-            batch: &crate::telemetry::collector::Batch,
-        ) -> std::io::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .extend_from_slice(batch.encoded_bytes());
-            Ok(())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    /// In-memory capture budget for runtime tests.
+    const CAPTURE_SIZE: u64 = 16 * 1024 * 1024;
 
     /// Nested `InstrumentedSpawnGuard`s must compose: inner drop must not
     /// clear the outer scope. Counter, not flag.
@@ -306,13 +338,14 @@ mod tests {
 
     #[test]
     fn current_thread_runtime_resolves_worker_ids() {
-        let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (capture, data) = CapturingProcessor::new();
 
         let mut builder = tokio::runtime::Builder::new_current_thread();
         builder.enable_all();
 
         let (rt, guard) = TracedRuntime::builder()
-            .build_and_start_with_writer(builder, CapturingWriter(data.clone()))
+            .with_custom_pipeline(|p| p.pipe(capture))
+            .build_and_start(builder, InMemoryWriter::new(CAPTURE_SIZE).unwrap())
             .unwrap();
 
         rt.block_on(async {
@@ -324,15 +357,17 @@ mod tests {
         });
 
         drop(rt);
-        drop(guard);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
 
         let raw = data.lock().unwrap();
-        let events = crate::telemetry::format::decode_events(&raw).unwrap();
+        let events = decode_captured(&raw);
         let poll_starts: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                crate::telemetry::events::TelemetryEvent::PollStart { worker_id, .. } => {
-                    Some(*worker_id)
+                crate::telemetry::analysis_events::Dial9Event::PollStartEvent(ev) => {
+                    Some(crate::telemetry::format::WorkerId(ev.worker_id.0))
                 }
                 _ => None,
             })
@@ -352,8 +387,97 @@ mod tests {
     }
 
     #[test]
+    fn tokio_instrumentation_can_be_disabled_without_installing_hooks() {
+        let (capture, data) = CapturingProcessor::new();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let on_thread_start_calls = hook_calls.clone();
+        let on_before_poll_calls = hook_calls.clone();
+
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(2).enable_all();
+
+        let (runtime, guard) = TracedRuntime::builder()
+            .with_tokio_instrumentation(false)
+            .with_task_tracking(true)
+            .with_tokio_hooks(|hooks| {
+                hooks.on_thread_start(move || {
+                    on_thread_start_calls.fetch_add(1, Ordering::Relaxed);
+                });
+                hooks.on_before_task_poll(move |_meta| {
+                    on_before_poll_calls.fetch_add(1, Ordering::Relaxed);
+                });
+            })
+            .with_custom_pipeline(|p| p.pipe(capture))
+            .build_and_start(builder, InMemoryWriter::new(CAPTURE_SIZE).unwrap())
+            .unwrap();
+
+        assert!(guard.is_enabled());
+        assert!(guard.shared().unwrap().is_enabled());
+        let runtime_meta = guard
+            .shared()
+            .unwrap()
+            .with_sources_mut(source::collect_segment_metadata)
+            .unwrap();
+        assert!(
+            !runtime_meta.iter().any(|(k, _)| k.starts_with("runtime.")),
+            "disabled Tokio instrumentation should not produce runtime metadata"
+        );
+
+        runtime.block_on(async {
+            for _ in 0..8 {
+                tokio::spawn(async {
+                    tokio::task::yield_now().await;
+                })
+                .await
+                .unwrap();
+            }
+        });
+
+        let runtime_meta = guard
+            .shared()
+            .unwrap()
+            .with_sources_mut(source::collect_segment_metadata)
+            .unwrap();
+        assert!(
+            !runtime_meta.iter().any(|(k, _)| k.starts_with("runtime.")),
+            "disabled Tokio instrumentation should not produce runtime metadata after running work"
+        );
+        assert_eq!(
+            hook_calls.load(Ordering::Relaxed),
+            0,
+            "user Tokio hooks should not be installed when Tokio instrumentation is disabled"
+        );
+
+        drop(runtime);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let raw = data.lock().unwrap();
+        let events = if raw.is_empty() {
+            Vec::new()
+        } else {
+            decode_captured(&raw)
+        };
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                crate::telemetry::analysis_events::Dial9Event::PollStartEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::PollEndEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::WorkerParkEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::WorkerUnparkEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::QueueSampleEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::TaskSpawnEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::TaskTerminateEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::WakeEvent(..)
+            )),
+            "Tokio runtime events should not be recorded when Tokio instrumentation is disabled: {events:?}"
+        );
+    }
+
+    #[test]
     fn test_shared_state_no_spawn_location_fields() {
-        let _shared = SharedState::new(crate::telemetry::events::clock_monotonic_ns(), None);
+        let _shared = SharedState::new(crate::telemetry::events::clock_monotonic_ns());
     }
 
     #[test]
@@ -361,13 +485,13 @@ mod tests {
         let builder = tokio::runtime::Builder::new_multi_thread();
         let (runtime, guard) = TracedRuntime::builder()
             .install(false)
-            .build(builder, NullWriter)
+            .build(builder, InMemoryWriter::new(16 * 1024 * 1024).unwrap())
             .unwrap();
 
         // Guard methods should be safe no-ops
         guard.enable();
         guard.disable();
-        let handle = guard.handle();
+        let handle = guard.tokio_handle(runtime.handle());
         let _start = guard.start_time();
 
         // Runtime should work normally, including handle.spawn
@@ -404,15 +528,14 @@ mod tests {
         let location_a = loc_a();
         let location_b = loc_b();
 
-        let writer = crate::telemetry::writer::RotatingWriter::builder()
+        let writer = crate::telemetry::writer::DiskWriter::builder()
             .base_path(&base)
             .max_file_size(100)
             .max_total_size(100_000)
             .build()
             .unwrap();
-        let mut ew = EventWriter::new(Box::new(writer));
-        let collector = Arc::new(CentralCollector::new());
-        let drain_epoch = AtomicU64::new(0);
+        let mut ew = writer;
+        let shared = crate::telemetry::recorder::SharedState::new(0);
 
         let locations = [
             location_a, location_b, location_a, location_b, location_a, location_b,
@@ -420,37 +543,28 @@ mod tests {
         for (i, loc) in locations.iter().enumerate() {
             let task_id = crate::telemetry::task_metadata::TaskId::from_u32(i as u32);
             let ts = (i as u64 + 1) * 1000;
-            buffer::with_encoder(
-                |enc| {
-                    let spawn_loc = enc.intern_location(loc);
-                    enc.encode(&crate::telemetry::format::TaskSpawnEvent {
-                        timestamp_ns: ts,
-                        task_id,
-                        spawn_loc,
-                        instrumented: true,
-                    });
-                },
-                &collector,
-                &drain_epoch,
-            );
-            buffer::with_encoder(
-                |enc| {
-                    let spawn_loc = enc.intern_location(loc);
-                    enc.encode(&crate::telemetry::format::PollStartEvent {
-                        timestamp_ns: ts,
-                        worker_id: WorkerId::from(0usize),
-                        local_queue: 0,
-                        task_id,
-                        spawn_loc,
-                    });
-                },
-                &collector,
-                &drain_epoch,
-            );
+            shared.flush_context().with_encoder(|enc| {
+                let spawn_loc = enc.intern_location(loc);
+                enc.encode(&crate::telemetry::format::TaskSpawnEvent {
+                    timestamp_ns: ts,
+                    task_id,
+                    spawn_loc,
+                    instrumented: true,
+                });
+            });
+            shared.flush_context().with_encoder(|enc| {
+                let spawn_loc = enc.intern_location(loc);
+                enc.encode(&crate::telemetry::format::PollStartEvent {
+                    timestamp_ns: ts,
+                    worker_id: WorkerId::from(0usize),
+                    local_queue: 0,
+                    task_id,
+                    spawn_loc,
+                });
+            });
             // Drain after each iteration to produce separate small batches
             // that trigger file rotation (max_file_size is 100 bytes).
-            buffer::drain_to_collector(&collector);
-            drain_collector_to_writer(&collector, &mut ew);
+            test_util::drain_into(&shared, &mut ew).unwrap();
         }
         ew.flush().unwrap();
         ew.finalize().unwrap();
@@ -473,19 +587,11 @@ mod tests {
             let path = file.to_str().unwrap();
             let reader = TraceReader::new(path).unwrap();
 
-            for (spawn_loc, loc) in &reader.spawn_locations {
+            for loc in reader.task_spawn_locs.values() {
                 assert!(
                     loc.contains(':'),
-                    "location should be file:line:col, got {loc:?} for {spawn_loc:?}"
+                    "location should be file:line:col, got {loc:?}"
                 );
-            }
-
-            for (task_id, spawn_loc) in &reader.task_spawn_locs {
-                reader.spawn_locations.get(spawn_loc).unwrap_or_else(|| {
-                    panic!(
-                        "file {path:?}: task {task_id:?} spawn_loc {spawn_loc:?} has no definition"
-                    )
-                });
             }
 
             let events = &reader.runtime_events;
@@ -501,7 +607,7 @@ mod tests {
     fn build_and_attach_to_telemetry_attaches_second_runtime() {
         let builder_a = tokio::runtime::Builder::new_multi_thread();
         let (runtime_a, guard) = TracedRuntime::builder()
-            .build_and_start_with_writer(builder_a, NullWriter)
+            .build_and_start(builder_a, InMemoryWriter::new(16 * 1024 * 1024).unwrap())
             .unwrap();
 
         let builder_b = tokio::runtime::Builder::new_multi_thread();
@@ -522,16 +628,16 @@ mod tests {
 
     #[test]
     fn build_and_attach_to_telemetry_produces_unique_worker_ids() {
-        use crate::telemetry::format::WorkerId;
         use std::collections::HashSet;
 
-        let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (capture, data) = CapturingProcessor::new();
 
         let mut builder_a = tokio::runtime::Builder::new_multi_thread();
         builder_a.worker_threads(2);
         let (runtime_a, guard) = TracedRuntime::builder()
             .with_task_tracking(true)
-            .build_and_start_with_writer(builder_a, CapturingWriter(data.clone()))
+            .with_custom_pipeline(|p| p.pipe(capture))
+            .build_and_start(builder_a, InMemoryWriter::new(CAPTURE_SIZE).unwrap())
             .unwrap();
 
         let mut builder_b = tokio::runtime::Builder::new_multi_thread();
@@ -569,22 +675,31 @@ mod tests {
         // Drop runtimes, then guard to flush
         drop(runtime_a);
         drop(runtime_b);
-        drop(guard);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
 
         let raw = data.lock().unwrap();
-        let captured = crate::telemetry::format::decode_events(&raw).unwrap();
+        let captured = decode_captured(&raw);
         let mut worker_ids: HashSet<u64> = HashSet::new();
         for event in captured.iter() {
-            match event {
-                crate::telemetry::events::TelemetryEvent::PollStart { worker_id, .. }
-                | crate::telemetry::events::TelemetryEvent::PollEnd { worker_id, .. }
-                | crate::telemetry::events::TelemetryEvent::WorkerPark { worker_id, .. }
-                | crate::telemetry::events::TelemetryEvent::WorkerUnpark { worker_id, .. }
-                    if *worker_id != WorkerId::UNKNOWN =>
-                {
-                    worker_ids.insert(worker_id.as_u64());
+            let wid = match event {
+                crate::telemetry::analysis_events::Dial9Event::PollStartEvent(e) => {
+                    Some(e.worker_id)
                 }
-                _ => {}
+                crate::telemetry::analysis_events::Dial9Event::PollEndEvent(e) => Some(e.worker_id),
+                crate::telemetry::analysis_events::Dial9Event::WorkerParkEvent(e) => {
+                    Some(e.worker_id)
+                }
+                crate::telemetry::analysis_events::Dial9Event::WorkerUnparkEvent(e) => {
+                    Some(e.worker_id)
+                }
+                _ => None,
+            };
+            if let Some(id) = wid
+                && id != crate::telemetry::analysis_events::WorkerId::UNKNOWN
+            {
+                worker_ids.insert(id.as_u64());
             }
         }
 
@@ -602,12 +717,12 @@ mod tests {
     /// (runtime name → worker ID mapping) into the trace file's segment metadata.
     #[test]
     fn build_and_attach_to_telemetry_propagates_second_runtime_metadata() {
-        use crate::telemetry::events::TelemetryEvent;
+        use crate::telemetry::analysis_events::Dial9Event;
 
         let dir = tempfile::TempDir::new().unwrap();
         let trace_path = dir.path().join("trace.bin");
 
-        let writer = crate::telemetry::writer::RotatingWriter::builder()
+        let writer = crate::telemetry::writer::DiskWriter::builder()
             .base_path(&trace_path)
             .max_file_size(1024 * 1024)
             .max_total_size(10 * 1024 * 1024)
@@ -650,10 +765,10 @@ mod tests {
 
         drop(runtime_a);
         drop(runtime_b);
-        let _ = guard.graceful_shutdown(std::time::Duration::from_secs(5));
+        let _ = guard.graceful_shutdown(std::time::Duration::from_secs(1));
 
         // Read all sealed trace files and collect SegmentMetadata entries.
-        let mut all_metadata: Vec<Vec<(String, String)>> = Vec::new();
+        let mut all_metadata: Vec<std::collections::HashMap<String, String>> = Vec::new();
         let mut files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -665,8 +780,8 @@ mod tests {
             let data = std::fs::read(file).unwrap();
             let events = crate::telemetry::format::decode_events(&data).unwrap();
             for event in &events {
-                if let TelemetryEvent::SegmentMetadata { entries, .. } = event {
-                    all_metadata.push(entries.clone());
+                if let Dial9Event::SegmentMetadataEvent(meta) = event {
+                    all_metadata.push(meta.entries.clone());
                 }
             }
         }
@@ -692,19 +807,121 @@ mod tests {
         );
     }
 
+    /// End-to-end: a runtime attached to an existing telemetry session has its
+    /// self-detected segment metadata (the runtime→worker mapping) written into
+    /// a sealed segment that decodes back. Exercises the full wiring:
+    /// `attach → TokioRuntimesSource::segment_metadata → writer → encode → decode`.
+    ///
+    /// Fully deterministic, with no `sleep`: the only synchronization is
+    /// `graceful_shutdown`, which blocks until the flush thread runs its final
+    /// source poll, writes the segment metadata, and seals the segment. Both
+    /// runtimes' workers are eagerly populated at attach time, so the metadata
+    /// is complete regardless of how (or whether) each runtime is driven.
+    ///
+    /// The narrower "re-emit only after the runtime/worker count actually grows"
+    /// logic is unit-tested deterministically in
+    /// `runtime_context::tests::segment_metadata_only_rebuilds_after_a_change`.
+    #[test]
+    fn attached_runtime_metadata_reaches_sealed_segment() {
+        use crate::telemetry::analysis_events::Dial9Event;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let trace_path = dir.path().join("trace.bin");
+
+        let writer = crate::telemetry::writer::DiskWriter::builder()
+            .base_path(&trace_path)
+            .max_file_size(1024 * 1024)
+            .max_total_size(10 * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        let builder_a = tokio::runtime::Builder::new_current_thread();
+        let (runtime_a, guard) = TracedRuntime::builder()
+            .with_runtime_name("first")
+            .with_task_tracking(true)
+            .with_trace_path(trace_path.to_str().unwrap())
+            .build_and_start(builder_a, writer)
+            .unwrap();
+
+        // Drive a little real work so the final segment is sealed rather than
+        // discarded: `finalize()` removes a segment that holds only header +
+        // metadata (no real events). Spawning a tracked task emits real events
+        // synchronously — no timing wait.
+        runtime_a.block_on(async {
+            tokio::spawn(async {
+                tokio::task::yield_now().await;
+            })
+            .await
+            .unwrap();
+        });
+
+        // Attach B to the same session. Its workers are eagerly populated at
+        // attach time, so its metadata is complete without ever driving it.
+        let builder_b = tokio::runtime::Builder::new_current_thread();
+        let runtime_b = TracedRuntime::builder()
+            .with_runtime_name("second")
+            .build_and_attach_to_telemetry(builder_b, &guard)
+            .unwrap();
+
+        drop(runtime_a);
+        drop(runtime_b);
+        // Blocks until the flush thread polls every source one final time, writes
+        // the segment metadata, and seals the segment, so both runtimes are
+        // guaranteed to be in the sealed trace once this returns.
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let mut saw_first = false;
+        let mut saw_second = false;
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "bin"))
+            .collect();
+        files.sort();
+        for file in &files {
+            let data = std::fs::read(file).unwrap();
+            let events = crate::telemetry::format::decode_events(&data).unwrap();
+            for event in &events {
+                if let Dial9Event::SegmentMetadataEvent(meta) = event {
+                    if meta.entries.keys().any(|k| k == "runtime.first") {
+                        saw_first = true;
+                    }
+                    if meta.entries.keys().any(|k| k == "runtime.second") {
+                        saw_second = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_first,
+            "the initial runtime should appear in segment metadata"
+        );
+        assert!(
+            saw_second,
+            "an attached runtime should appear in a sealed segment's metadata; \
+             missing runtime.second means TokioRuntimesSource failed to \
+             self-detect the new runtime"
+        );
+    }
+
     /// Wake events from runtime B's workers must carry global worker IDs (≥ num_workers_a),
     /// not local indices that collide with runtime A's workers.
     #[test]
     fn wake_events_use_global_worker_id_in_multi_runtime() {
-        use crate::telemetry::events::TelemetryEvent;
+        use crate::telemetry::analysis_events::Dial9Event;
 
-        let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (capture, data) = CapturingProcessor::new();
 
         let mut builder_a = tokio::runtime::Builder::new_multi_thread();
         builder_a.worker_threads(2);
         let (runtime_a, guard) = TracedRuntime::builder()
             .with_task_tracking(true)
-            .build_and_start_with_writer(builder_a, CapturingWriter(data.clone()))
+            .with_custom_pipeline(|p| p.pipe(capture))
+            .build_and_start(builder_a, InMemoryWriter::new(CAPTURE_SIZE).unwrap())
             .unwrap();
 
         let mut builder_b = tokio::runtime::Builder::new_multi_thread();
@@ -714,8 +931,8 @@ mod tests {
             .build_and_attach_to_telemetry(builder_b, &guard)
             .unwrap();
 
-        // Use handle.spawn on runtime B to get wake-tracked wrapping → wake events.
-        let handle = guard.handle();
+        // Spawn on runtime B with wake-tracked wrapping → wake events.
+        let handle = guard.tokio_handle(runtime_b.handle());
         runtime_b.block_on(async {
             let mut handles = Vec::new();
             for _ in 0..50 {
@@ -730,14 +947,16 @@ mod tests {
 
         drop(runtime_a);
         drop(runtime_b);
-        drop(guard);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
 
         let raw = data.lock().unwrap();
-        let captured = crate::telemetry::format::decode_events(&raw).unwrap();
+        let captured = decode_captured(&raw);
         let wake_workers: Vec<u8> = captured
             .iter()
             .filter_map(|e| match e {
-                TelemetryEvent::WakeEvent { target_worker, .. } => Some(*target_worker),
+                Dial9Event::WakeEvent(w) => Some(w.target_worker),
                 _ => None,
             })
             .collect();
@@ -757,42 +976,38 @@ mod tests {
     mod rotation_proptest {
         use super::*;
         use crate::telemetry::analysis::TraceReader;
-        use crate::telemetry::events::{CpuSampleData, CpuSampleSource, TelemetryEvent};
-        use crate::telemetry::format::WorkerId;
+        use crate::telemetry::analysis_events::Dial9Event;
+        use crate::telemetry::format::{WorkerId, WorkerParkEvent};
         use crate::telemetry::task_metadata::TaskId;
-        use crate::telemetry::writer::RotatingWriter;
+        use crate::telemetry::writer::DiskWriter;
         use proptest::prelude::*;
+
+        /// Encode a single event into a batch and write it through the writer.
+        fn write_raw_event(
+            writer: &mut DiskWriter,
+            event: &dyn crate::telemetry::buffer::Encodable,
+        ) -> std::io::Result<()> {
+            test_util::write_event(writer, event)
+        }
 
         #[derive(Debug, Clone)]
         enum FlushOp {
-            CpuSample {
-                worker_id: WorkerId,
-                tid: u32,
-                callchain: Vec<u64>,
-            },
-            PollStart {
-                location_idx: usize,
-            },
+            OtherEvent { worker_id: WorkerId, tid: u32 },
+            PollStart { location_idx: usize },
         }
 
         fn arb_flush_op() -> impl Strategy<Value = FlushOp> {
             prop_oneof![
-                (
-                    prop::bool::ANY,
-                    0u32..4,
-                    prop::collection::vec(0u64..8, 0..3),
-                )
-                    .prop_map(|(is_worker, tid, callchain)| {
-                        FlushOp::CpuSample {
-                            worker_id: if is_worker {
-                                WorkerId::from(0usize)
-                            } else {
-                                WorkerId::UNKNOWN
-                            },
-                            tid,
-                            callchain,
-                        }
-                    }),
+                (prop::bool::ANY, 0u32..4,).prop_map(|(is_worker, tid)| {
+                    FlushOp::OtherEvent {
+                        worker_id: if is_worker {
+                            WorkerId::from(0usize)
+                        } else {
+                            WorkerId::UNKNOWN
+                        },
+                        tid,
+                    }
+                }),
                 (0usize..3).prop_map(|idx| FlushOp::PollStart { location_idx: idx }),
             ]
         }
@@ -807,7 +1022,7 @@ mod tests {
             (
                 prop::collection::vec(arb_flush_op(), 0..12).prop_map(|ops| {
                     ops.into_iter()
-                        .filter(|o| matches!(o, FlushOp::CpuSample { .. }))
+                        .filter(|o| matches!(o, FlushOp::OtherEvent { .. }))
                         .collect()
                 }),
                 prop::collection::vec(arb_flush_op(), 0..12).prop_map(|ops| {
@@ -821,29 +1036,25 @@ mod tests {
 
         fn execute_flush_round(
             round: &FlushRound,
-            ew: &mut EventWriter,
+            ew: &mut DiskWriter,
             locations: &[&'static Location<'static>],
             timestamp: &mut u64,
             expected_raw: &mut usize,
         ) {
             for op in &round.cpu_ops {
-                if let FlushOp::CpuSample {
-                    worker_id,
-                    tid,
-                    callchain,
-                } = op
-                {
-                    let data = CpuSampleData {
-                        timestamp_nanos: *timestamp,
-                        worker_id: *worker_id,
-                        tid: *tid,
-                        source: CpuSampleSource::CpuProfile,
-                        thread_name: None,
-                        callchain: callchain.clone(),
-                        cpu: None,
-                    };
+                if let FlushOp::OtherEvent { worker_id, tid } = op {
+                    write_raw_event(
+                        &mut *ew,
+                        &WorkerParkEvent {
+                            timestamp_ns: *timestamp,
+                            worker_id: *worker_id,
+                            local_queue: 0,
+                            cpu_time_ns: 0,
+                            tid: *tid,
+                        },
+                    )
+                    .unwrap();
                     *timestamp += 1;
-                    ew.write_raw_event(&data).unwrap();
                 }
             }
 
@@ -854,13 +1065,16 @@ mod tests {
                     let ts = *timestamp;
                     *timestamp += 1;
 
-                    ew.write_raw_event(&runtime_context::PollStart {
-                        timestamp_ns: ts,
-                        worker_id: WorkerId::from(0usize),
-                        local_queue: 0,
-                        task_id,
-                        location: loc,
-                    })
+                    write_raw_event(
+                        &mut *ew,
+                        &runtime_context::PollStart {
+                            timestamp_ns: ts,
+                            worker_id: WorkerId::from(0usize),
+                            local_queue: 0,
+                            task_id,
+                            location: loc,
+                        },
+                    )
                     .unwrap();
                     *expected_raw += 1;
                 }
@@ -883,24 +1097,9 @@ mod tests {
                 let reader = TraceReader::new(path_str)
                     .unwrap_or_else(|e| panic!("failed to open {path_str}: {e}"));
 
-                // In the new format, spawn locations come from the string pool.
-                // Verify every PollStart's spawn_loc_id resolves.
-                let spawn_locs = &reader.spawn_locations;
-
                 for ev in &reader.all_events {
-                    match ev {
-                        TelemetryEvent::PollStart { spawn_loc, .. } => {
-                            assert!(
-                                spawn_locs.contains_key(spawn_loc),
-                                "{path_str}: PollStart references spawn_loc {spawn_loc:?} but no definition in this file. Defs: {spawn_locs:?}"
-                            );
-                            total_raw += 1;
-                        }
-                        TelemetryEvent::CpuSample { .. } => {
-                            // Callchain addresses are raw; symbolization
-                            // happens in the background worker now.
-                        }
-                        _ => {}
+                    if matches!(ev, Dial9Event::PollStartEvent(_)) {
+                        total_raw += 1;
                     }
                 }
             }
@@ -918,14 +1117,14 @@ mod tests {
                 let dir = tempfile::TempDir::new().unwrap();
                 let base = dir.path().join("trace");
 
-                let writer = RotatingWriter::builder()
+                let writer = DiskWriter::builder()
                     .base_path(&base)
                     .max_file_size(max_file_size)
                     .max_total_size(1_000_000)
                     .build()
                     .unwrap();
 
-                let mut ew = EventWriter::new(Box::new(writer));
+                let mut ew = writer;
 
                 #[track_caller]
                 fn loc0() -> &'static Location<'static> { Location::caller() }
@@ -962,14 +1161,20 @@ mod tests {
 
     #[test]
     fn telemetry_core_builds_guard_without_runtime() {
-        let guard = TelemetryCore::builder().writer(NullWriter).build().unwrap();
+        let guard = TelemetryCore::builder()
+            .writer(InMemoryWriter::new(16 * 1024 * 1024).unwrap())
+            .build()
+            .unwrap();
         assert!(guard.is_enabled());
         let _ = guard.graceful_shutdown(std::time::Duration::from_secs(1));
     }
 
     #[test]
     fn telemetry_core_trace_runtime_produces_working_runtime() {
-        let guard = TelemetryCore::builder().writer(NullWriter).build().unwrap();
+        let guard = TelemetryCore::builder()
+            .writer(InMemoryWriter::new(16 * 1024 * 1024).unwrap())
+            .build()
+            .unwrap();
         guard.enable();
 
         let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -987,9 +1192,10 @@ mod tests {
 
     #[test]
     fn telemetry_core_task_tracking_produces_task_spawn_events() {
-        let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (capture, data) = CapturingProcessor::new();
         let guard = TelemetryCore::builder()
-            .writer(CapturingWriter(data.clone()))
+            .writer(InMemoryWriter::new(CAPTURE_SIZE).unwrap())
+            .processors(vec![Box::new(capture)])
             .build()
             .unwrap();
         guard.enable();
@@ -1009,16 +1215,18 @@ mod tests {
         });
 
         drop(runtime);
-        drop(guard);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
 
         let raw = data.lock().unwrap();
-        let events = crate::telemetry::format::decode_events(&raw).unwrap();
+        let events = decode_captured(&raw);
         let spawn_count = events
             .iter()
             .filter(|e| {
                 matches!(
                     e,
-                    crate::telemetry::events::TelemetryEvent::TaskSpawn { .. }
+                    crate::telemetry::analysis_events::Dial9Event::TaskSpawnEvent(..)
                 )
             })
             .count();
@@ -1030,12 +1238,12 @@ mod tests {
 
     #[test]
     fn telemetry_core_trace_runtime_multiple_runtimes_unique_worker_ids() {
-        use crate::telemetry::format::WorkerId;
         use std::collections::HashSet;
 
-        let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (capture, data) = CapturingProcessor::new();
         let guard = TelemetryCore::builder()
-            .writer(CapturingWriter(data.clone()))
+            .writer(InMemoryWriter::new(CAPTURE_SIZE).unwrap())
+            .processors(vec![Box::new(capture)])
             .build()
             .unwrap();
         guard.enable();
@@ -1072,16 +1280,18 @@ mod tests {
 
         drop(runtime_a);
         drop(runtime_b);
-        drop(guard);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
 
         let raw = data.lock().unwrap();
-        let captured = crate::telemetry::format::decode_events(&raw).unwrap();
+        let captured = decode_captured(&raw);
         let mut worker_ids: HashSet<u64> = HashSet::new();
         for event in &captured {
-            if let crate::telemetry::events::TelemetryEvent::PollStart { worker_id, .. } = event
-                && *worker_id != WorkerId::UNKNOWN
+            if let crate::telemetry::analysis_events::Dial9Event::PollStartEvent(e) = event
+                && e.worker_id != crate::telemetry::analysis_events::WorkerId::UNKNOWN
             {
-                worker_ids.insert(worker_id.as_u64());
+                worker_ids.insert(e.worker_id.as_u64());
             }
         }
 
@@ -1095,9 +1305,10 @@ mod tests {
 
     #[test]
     fn trace_runtime_build_returns_telemetry_handle() {
-        let data = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (capture, data) = CapturingProcessor::new();
         let guard = TelemetryCore::builder()
-            .writer(CapturingWriter(data.clone()))
+            .writer(InMemoryWriter::new(CAPTURE_SIZE).unwrap())
+            .processors(vec![Box::new(capture)])
             .build()
             .unwrap();
         guard.enable();
@@ -1120,27 +1331,26 @@ mod tests {
         });
 
         // Drain thread-local buffers before shutdown.
-        crate::telemetry::buffer::drain_to_collector(
-            &guard
-                .handle()
-                .traced_handle()
+        test_util::drain_thread_local(
+            &traced_handle(&guard.handle())
                 .expect("enabled handle must yield a TracedHandle")
-                .shared
-                .collector,
+                .shared,
         );
 
         drop(runtime);
-        drop(guard);
+        guard
+            .graceful_shutdown(std::time::Duration::from_secs(1))
+            .unwrap();
 
         // Verify wake events were recorded (handle.spawn wraps with wake tracking)
         let raw = data.lock().unwrap();
-        let events = crate::telemetry::format::decode_events(&raw).unwrap();
+        let events = decode_captured(&raw);
         let wake_count = events
             .iter()
             .filter(|e| {
                 matches!(
                     e,
-                    crate::telemetry::events::TelemetryEvent::WakeEvent { .. }
+                    crate::telemetry::analysis_events::Dial9Event::WakeEvent(..)
                 )
             })
             .count();
@@ -1154,7 +1364,10 @@ mod tests {
     /// correct runtime even when called from outside any runtime context.
     #[test]
     fn trace_runtime_handle_spawns_on_correct_runtime_from_outside() {
-        let guard = TelemetryCore::builder().writer(NullWriter).build().unwrap();
+        let guard = TelemetryCore::builder()
+            .writer(InMemoryWriter::new(16 * 1024 * 1024).unwrap())
+            .build()
+            .unwrap();
         guard.enable();
 
         let mut builder_a = tokio::runtime::Builder::new_multi_thread();
@@ -1207,7 +1420,7 @@ mod tests {
     #[test]
     fn try_new_enabled_path_returns_value_and_exposes_guard() {
         let cfg = crate::Dial9Config::builder()
-            .base_path(dial9_config_tmp_base_path())
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .max_file_size(1024 * 1024)
             .max_total_size(4 * 1024 * 1024)
             .build()
@@ -1226,6 +1439,7 @@ mod tests {
     #[test]
     fn try_new_disabled_path_returns_value_no_guard() {
         let cfg = crate::Dial9Config::builder()
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .enabled(false)
             .build()
             .expect("disabled build should succeed");
@@ -1248,6 +1462,7 @@ mod tests {
         // tests assert that the inner `TelemetryRuntimeError` formats
         // through `Display` correctly.
         let cfg = crate::Dial9Config::builder()
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .enabled(false)
             .build()
             .expect("disabled build should succeed");
@@ -1274,7 +1489,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Always-present TelemetryGuard / inert TelemetryHandle (Phase 3)
+    // Always-present TelemetryGuard / inert Dial9Handle (Phase 3)
     // ---------------------------------------------------------------
 
     /// Off-runtime callers should get a usable, inert handle rather
@@ -1283,7 +1498,7 @@ mod tests {
     fn telemetry_handle_current_off_runtime_returns_inert_handle() {
         // We're on the test thread, which is not owned by any dial9
         // runtime. `current()` used to panic here.
-        let handle = TelemetryHandle::current();
+        let handle = Dial9Handle::current();
         assert!(
             !handle.is_enabled(),
             "off-runtime current() must return an inert handle"
@@ -1293,11 +1508,11 @@ mod tests {
         handle.disable();
     }
 
-    /// `TelemetryHandle::disabled` is the explicit constructor for an
+    /// `Dial9Handle::disabled` is the explicit constructor for an
     /// inert handle.
     #[test]
     fn telemetry_handle_disabled_constructor_is_inert() {
-        let handle = TelemetryHandle::disabled();
+        let handle = Dial9Handle::disabled();
         assert!(!handle.is_enabled());
     }
 
@@ -1310,7 +1525,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let handle = TelemetryHandle::disabled();
+        let handle = Dial9TokioHandle::disabled();
         let result = runtime.block_on(async move {
             handle
                 .spawn(async { 17u32 })
@@ -1337,6 +1552,7 @@ mod tests {
     #[test]
     fn disabled_dial9_config_yields_inert_guard() {
         let cfg = crate::Dial9Config::builder()
+            .on_disk_buffer(dial9_config_tmp_base_path())
             .enabled(false)
             .build()
             .expect("disabled build should succeed");
@@ -1356,7 +1572,7 @@ mod tests {
     #[cfg(feature = "worker-s3")]
     #[test]
     fn with_s3_client_then_with_s3_uploader_preserves_client() {
-        use crate::background_task::s3::S3Config;
+        use crate::{background_task::s3::S3Config, telemetry::Disk};
 
         fn dummy_client() -> aws_sdk_s3::Client {
             let conf = aws_sdk_s3::Config::builder()
@@ -1370,16 +1586,14 @@ mod tests {
         }
 
         fn cfg(boot_id: &str) -> S3Config {
-            S3Config::builder()
-                .bucket("b")
-                .service_name("s")
-                .boot_id(boot_id)
-                .build()
+            let mut c = S3Config::builder().bucket("b").service_name("s").build();
+            c.set_boot_id(boot_id);
+            c
         }
 
         // Order A: client set after the uploader — already worked.
         let mut builder = TracedRuntime::builder()
-            .with_s3_uploader(cfg("a"))
+            .with_s3_uploader::<Disk>(cfg("a"))
             .with_s3_client(dummy_client());
         match &mut builder.pipeline {
             PipelineConfig::S3(u) => {
@@ -1394,7 +1608,7 @@ mod tests {
         // Order B: client set first, then a follow-up `with_s3_uploader`. The
         // replacement must carry the previously-bound client across.
         let mut builder = TracedRuntime::builder()
-            .with_s3_uploader(cfg("a"))
+            .with_s3_uploader::<Disk>(cfg("a"))
             .with_s3_client(dummy_client())
             .with_s3_uploader(cfg("b"));
         match &mut builder.pipeline {
@@ -1415,6 +1629,7 @@ mod tests {
     /// `with_segment_metadata`.
     mod segment_metadata_routing {
         use super::*;
+        use crate::telemetry::writer::Disk;
 
         fn entries<P, M>(builder: &TracedRuntimeBuilder<P, M>) -> &[(String, String)] {
             &builder.segment_metadata
@@ -1422,18 +1637,19 @@ mod tests {
 
         #[cfg(feature = "worker-s3")]
         fn s3_cfg() -> crate::background_task::s3::S3Config {
-            crate::background_task::s3::S3Config::builder()
+            let mut c = crate::background_task::s3::S3Config::builder()
                 .bucket("test-bucket")
                 .service_name("checkout-api")
                 .instance_path("us-east-1/i-0abc123")
-                .boot_id("test-boot")
-                .build()
+                .build();
+            c.set_boot_id("test-boot");
+            c
         }
 
         #[cfg(feature = "worker-s3")]
         #[test]
         fn s3_preset_populates_from_config() {
-            let builder = TracedRuntime::builder().with_s3_uploader(s3_cfg());
+            let builder = TracedRuntime::builder().with_s3_uploader::<Disk>(s3_cfg());
             let m: std::collections::HashMap<&str, &str> = entries(&builder)
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1447,13 +1663,13 @@ mod tests {
         #[cfg(feature = "worker-s3")]
         #[test]
         fn s3_preset_replace_overwrites_metadata() {
-            let cfg2 = crate::background_task::s3::S3Config::builder()
+            let mut cfg2 = crate::background_task::s3::S3Config::builder()
                 .bucket("other-bucket")
                 .service_name("other-svc")
-                .boot_id("other-boot")
                 .build();
+            cfg2.set_boot_id("other-boot");
             let builder = TracedRuntime::builder()
-                .with_s3_uploader(s3_cfg())
+                .with_s3_uploader::<Disk>(s3_cfg())
                 .with_s3_uploader(cfg2);
             let m: std::collections::HashMap<&str, &str> = entries(&builder)
                 .iter()
@@ -1514,7 +1730,7 @@ mod tests {
         fn with_segment_metadata_after_s3_overrides_preset() {
             let custom = vec![("env".to_string(), "prod".to_string())];
             let builder = TracedRuntime::builder()
-                .with_s3_uploader(s3_cfg())
+                .with_s3_uploader::<Disk>(s3_cfg())
                 .with_segment_metadata(custom.clone());
             assert_eq!(entries(&builder), custom.as_slice());
         }
@@ -1526,7 +1742,7 @@ mod tests {
         fn s3_after_with_segment_metadata_overwrites() {
             let builder = TracedRuntime::builder()
                 .with_segment_metadata(vec![("env".into(), "prod".into())])
-                .with_s3_uploader(s3_cfg());
+                .with_s3_uploader::<Disk>(s3_cfg());
             let m: std::collections::HashMap<&str, &str> = entries(&builder)
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1552,7 +1768,7 @@ mod tests {
         let s3 = S3Config::builder().bucket("b").service_name("s").build();
 
         let guard = TelemetryCore::builder()
-            .writer(NullWriter)
+            .writer(InMemoryWriter::new(16 * 1024 * 1024).unwrap())
             .trace_path(&trace_path)
             .s3_config(s3)
             .build()
@@ -1565,16 +1781,17 @@ mod tests {
     /// Regression test: `TelemetryCore::builder()` with `cpu_profiling` but
     /// without `s3_config` must auto-wire the processor pipeline (symbolize +
     /// gzip + write-back) so the background worker is spawned.
-    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
+    #[cfg(feature = "cpu-profiling")]
     #[test]
     fn telemetry_core_builder_cpu_profiling_auto_wires_processors() {
-        use crate::telemetry::cpu_profile::CpuProfilingConfig;
+        use crate::telemetry::writer::DiskWriter;
+        use dial9_perf_self_profile::CpuProfilingConfig;
 
         let dir = tempfile::tempdir().unwrap();
         let trace_path = dir.path().join("trace.bin");
 
         // Small max_file_size to force rotation quickly.
-        let writer = RotatingWriter::new(&trace_path, 4 * 1024, 10 * 1024 * 1024).unwrap();
+        let writer = DiskWriter::new(&trace_path, 4 * 1024, 10 * 1024 * 1024).unwrap();
 
         let guard = TelemetryCore::builder()
             .writer(writer)

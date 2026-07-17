@@ -1,7 +1,7 @@
 //! Integration test: verify JS trace parser matches Rust parser
 
-use dial9_tokio_telemetry::analysis_unstable::TraceReader;
-use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::{DiskWriter, TracedRuntime};
+use dial9_trace_format::decoder::Decoder;
 use std::io::{BufWriter, Write};
 use std::process::Command;
 use tempfile::TempDir;
@@ -34,13 +34,13 @@ fn test_js_parser_matches_rust() {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.worker_threads(2).enable_all();
 
-        let writer = RotatingWriter::single_file(&trace_path).unwrap();
+        let writer = DiskWriter::single_file(&trace_path).unwrap();
         #[allow(unused_mut)]
         let mut tb = TracedRuntime::builder().with_task_tracking(true);
         #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         {
             tb = tb.with_cpu_profiling(
-                dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig::default(),
+                dial9_tokio_telemetry::telemetry::CpuProfilingConfig::default(),
             );
         }
         let (runtime, _guard) = tb.build_and_start(builder, writer).unwrap();
@@ -59,15 +59,19 @@ fn test_js_parser_matches_rust() {
     let sealed_path = temp_dir.path().join("test_trace.0.bin");
     eprintln!("Generated trace at {}", sealed_path.display());
 
-    // Export to JSONL using Rust parser (in-process to avoid cargo subprocess overhead)
+    // Export to JSONL using serde decoder (in-process)
     {
-        let reader = TraceReader::new(sealed_path.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&sealed_path).unwrap();
+        let mut decoder = Decoder::new(&data).unwrap();
         let file = std::fs::File::create(&jsonl_path).unwrap();
         let mut w = BufWriter::new(file);
-        for e in &reader.all_events {
-            serde_json::to_writer(&mut w, &e).unwrap();
-            w.write_all(b"\n").unwrap();
-        }
+        decoder
+            .for_each_event(|raw| {
+                let ev: serde_json::Value = raw.deserialize().expect("deserialize");
+                serde_json::to_writer(&mut w, &ev).unwrap();
+                w.write_all(b"\n").unwrap();
+            })
+            .unwrap();
         w.flush().unwrap();
     }
 

@@ -10,7 +10,7 @@
 //! Modes:
 //!   baseline  – plain tokio runtime, no hooks
 //!   telemetry – hooks installed, writing to a temp file
-//!   noop      – hooks installed, NullWriter (measures pure hook overhead)
+//!   noop      – hooks installed, InMemoryWriter (no I/O)
 //!
 //! Duration defaults to 30 seconds. A 3-second warmup precedes measurement.
 //! --bmf runs all three modes and outputs Bencher Metric Format JSON.
@@ -18,9 +18,9 @@
 mod bmf;
 
 #[cfg(target_os = "linux")]
-use dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig;
+use dial9_tokio_telemetry::telemetry::CpuProfilingConfig;
 use dial9_tokio_telemetry::telemetry::{
-    NullWriter, RotatingWriter, TelemetryGuard, TelemetryHandle, TracedRuntime,
+    Dial9TokioHandle, DiskWriter, InMemoryWriter, TelemetryGuard, TracedRuntime,
 };
 use hdrhistogram::Histogram;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ const WARMUP_SECS: u64 = 3;
 
 // ── Echo server (runs on the traced runtime) ─────────────────────────────────
 
-async fn echo_server(listener: TcpListener, handle: Option<TelemetryHandle>) {
+async fn echo_server(listener: TcpListener, handle: Option<Dial9TokioHandle>) {
     loop {
         let (mut sock, _) = match listener.accept().await {
             Ok(c) => c,
@@ -109,7 +109,7 @@ fn run_bench(mode: &str, duration_secs: u64) -> BenchResult {
 
     let (server_rt, guard): (tokio::runtime::Runtime, Option<TelemetryGuard>) = match mode {
         "telemetry" => {
-            let writer = RotatingWriter::single_file("/tmp/overhead_bench_trace.bin").unwrap();
+            let writer = DiskWriter::single_file("/tmp/overhead_bench_trace.bin").unwrap();
             #[allow(unused_mut)]
             let mut tb = TracedRuntime::builder().with_task_tracking(true);
             #[cfg(target_os = "linux")]
@@ -121,7 +121,7 @@ fn run_bench(mode: &str, duration_secs: u64) -> BenchResult {
         }
         "noop" => {
             let (rt, g) = TracedRuntime::builder()
-                .build_and_start(builder, NullWriter)
+                .build_and_start(builder, InMemoryWriter::new(16 * 1024 * 1024).unwrap())
                 .unwrap();
             (rt, Some(g))
         }
@@ -135,7 +135,9 @@ fn run_bench(mode: &str, duration_secs: u64) -> BenchResult {
     let port = server_rt.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let handle = guard.as_ref().map(|g| g.handle());
+        let handle = guard
+            .as_ref()
+            .map(|g| g.tokio_handle(&tokio::runtime::Handle::current()));
         tokio::spawn(echo_server(listener, handle));
         port
     });

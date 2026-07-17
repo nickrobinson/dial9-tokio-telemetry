@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use dial9_tokio_telemetry::Dial9Config;
 use dial9_tokio_telemetry::background_task::{ProcessError, SegmentData, SegmentProcessor};
-use dial9_tokio_telemetry::telemetry::TelemetryHandle;
+use dial9_tokio_telemetry::telemetry::Dial9TokioHandle;
 
 const TRACE_DIR: &str = "/tmp/dial9-custom-pipeline";
 
@@ -186,7 +186,7 @@ async fn worker_task(id: usize) {
     let base_path = format!("{TRACE_DIR}/trace.bin");
 
     Dial9Config::builder()
-        .base_path(base_path)
+        .on_disk_buffer(base_path)
         // Small per-file budget + short rotation period so we get several
         // sealed segments in a few seconds of work - otherwise the whole
         // run might fit in a single segment and the stateful processor
@@ -211,7 +211,7 @@ async fn worker_task(id: usize) {
 async fn main() {
     println!("Running workload, traces under {TRACE_DIR}/");
 
-    let handle = TelemetryHandle::current();
+    let handle = Dial9TokioHandle::current();
     let tasks: Vec<_> = (0..32).map(|i| handle.spawn(worker_task(i))).collect();
     for task in tasks {
         let _ = task.await;

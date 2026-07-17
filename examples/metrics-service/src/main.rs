@@ -8,17 +8,28 @@ use std::time::Duration;
 
 use aws_config::BehaviorVersion;
 use clap::Parser;
-#[cfg(target_os = "linux")]
-use dial9_tokio_telemetry::telemetry::cpu_profile::{CpuProfilingConfig, SchedEventConfig};
-use dial9_tokio_telemetry::telemetry::{
-    RotatingWriter, TaskDumpConfig, TelemetryHandle, TracedRuntime,
+use dial9_tokio_telemetry::memory_profiling::{
+    Dial9Allocator, MemoryProfiler, MemoryProfilingConfig,
 };
-use dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer;
+#[cfg(target_os = "linux")]
+use dial9_tokio_telemetry::telemetry::SocketAcceptQueuesConfig;
+#[cfg(target_os = "linux")]
+use dial9_tokio_telemetry::telemetry::{CpuProfilingConfig, SchedEventConfig};
+use dial9_tokio_telemetry::telemetry::{
+    Dial9TokioHandle, DiskWriter, ProcessResourceUsageConfig, TaskDumpConfig, TracedRuntime,
+};
+use dial9_tokio_telemetry::tracing_layer::Dial9TracingLayer;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 
 use buffer::MetricsBuffer;
 use ddb::DdbClient;
+use metrique::local::{LocalFormat, OutputStyle};
+use metrique::writer::format::FormatExt;
+use metrique::writer::sink::FlushImmediatelyBuilder;
+
+#[global_allocator]
+static ALLOC: Dial9Allocator = Dial9Allocator::system();
 
 #[derive(Parser)]
 #[command(about = "Metrics service with DynamoDB persistence and telemetry")]
@@ -80,6 +91,33 @@ struct Args {
 
     #[arg(long, help = "Disable task dump capture")]
     no_task_dumps: bool,
+
+    #[arg(long, help = "Spawn a task that leaks memory continuously")]
+    leak: bool,
+
+    #[arg(long, help = "Disable memory profiling")]
+    no_memory_profiling: bool,
+
+    #[arg(
+        long,
+        default_value = "524288",
+        help = "Mean bytes between sampled allocations (default: 512 KiB)"
+    )]
+    alloc_sample_rate_bytes: u64,
+
+    #[arg(
+        long,
+        help = "Disable liveset tracking for leak detection (default: enabled)"
+    )]
+    no_track_liveset: bool,
+
+    #[arg(
+        long,
+        help = "Path to write pipeline metrics (Symbolize.Time, Gzip.Time, etc). \
+                When set, dial9 worker pipeline metrics are appended here in line-oriented format. \
+                Useful for measuring per-segment processor timings."
+    )]
+    worker_metrics_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -128,7 +166,7 @@ fn main() -> std::io::Result<()> {
                 ),
         )
         .with(
-            Dial9TokioLayer::new().with_filter(
+            Dial9TracingLayer::new().with_filter(
                 tracing_subscriber::filter::Targets::new()
                     .with_target("metrics_service", tracing::Level::TRACE)
                     .with_default(tracing::Level::ERROR),
@@ -154,7 +192,7 @@ fn main() -> std::io::Result<()> {
         args.trace_max_total_size = 100_000_000;
     }
 
-    let writer = RotatingWriter::builder()
+    let writer = DiskWriter::builder()
         .base_path(&args.trace_path)
         .max_file_size(args.trace_max_file_size)
         .max_total_size(args.trace_max_total_size)
@@ -172,7 +210,23 @@ fn main() -> std::io::Result<()> {
     builder.worker_threads(args.worker_threads).enable_all();
     let traced_builder = TracedRuntime::builder()
         .with_trace_path(&args.trace_path)
-        .with_task_tracking(true);
+        .with_task_tracking(true)
+        .with_process_resource_usage(ProcessResourceUsageConfig::default());
+    let traced_builder = if let Some(path) = &args.worker_metrics_path {
+        // Open in append mode so multiple runs accumulate into the same
+        // file. Each segment processed by the dial9 background worker
+        // appends one line with PipelineMetrics including
+        // `Symbolize.Time`, `Gzip.Time`, `S3Upload.Time`, etc.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let sink = FlushImmediatelyBuilder::new()
+            .build_boxed(LocalFormat::new(OutputStyle::Pretty).output_to(file));
+        traced_builder.with_worker_metrics_sink(sink)
+    } else {
+        traced_builder
+    };
     let traced_builder = if args.no_task_dumps {
         traced_builder
     } else {
@@ -185,7 +239,8 @@ fn main() -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     let traced_builder = traced_builder
         .with_cpu_profiling(CpuProfilingConfig::default())
-        .with_sched_events(SchedEventConfig::default().include_kernel(true));
+        .with_sched_events(SchedEventConfig::default().include_kernel(true))
+        .with_socket_accept_queues(SocketAcceptQueuesConfig::default());
 
     let (runtime, guard) = if let Some(bucket) = &args.s3_bucket {
         use dial9_tokio_telemetry::background_task::s3::S3Config;
@@ -200,7 +255,6 @@ fn main() -> std::io::Result<()> {
                     .to_string_lossy()
                     .to_string(),
             )
-            .boot_id(uuid::Uuid::new_v4().to_string())
             .maybe_region(args.s3_region.as_ref())
             .build();
 
@@ -211,10 +265,24 @@ fn main() -> std::io::Result<()> {
         traced_builder.build(builder, writer)?
     };
     guard.enable();
-    let handle = guard.handle();
+    let handle = guard.tokio_handle(runtime.handle());
+
+    let _mem_guard = if args.no_memory_profiling {
+        None
+    } else {
+        let config = MemoryProfilingConfig::builder()
+            .sample_rate_bytes(args.alloc_sample_rate_bytes)
+            .track_liveset(!args.no_track_liveset)
+            .build();
+        Some(
+            MemoryProfiler::from_config(config)
+                .install(guard.handle())
+                .expect("failed to install memory profiler"),
+        )
+    };
 
     // Wrap the body in a spawned task so the root future is instrumented.
-    // Inside, TelemetryHandle::current() is available on every worker thread.
+    // Inside, Dial9TokioHandle::current() is available on every worker thread.
     runtime.block_on(async {
         handle
             .spawn(async move {
@@ -234,7 +302,7 @@ fn main() -> std::io::Result<()> {
                     .await
                     .expect("failed to ensure DynamoDB table");
 
-                let handle = TelemetryHandle::current();
+                let handle = Dial9TokioHandle::current();
 
                 // background flush worker
                 let flush_state = state.clone();
@@ -246,6 +314,18 @@ fn main() -> std::io::Result<()> {
                         flush_state.buffer.flush_to_ddb(&flush_state.ddb).await;
                     }
                 });
+
+                // intentional leak task: accumulates memory without freeing it
+                if args.leak {
+                    handle.spawn(async move {
+                        let mut sink: Vec<Vec<u8>> = Vec::new();
+                        let mut interval = tokio::time::interval(Duration::from_millis(10));
+                        loop {
+                            interval.tick().await;
+                            sink.push(vec![0u8; 512 * 1024]);
+                        }
+                    });
+                }
 
                 let app = routes::router(state);
                 let listener = tokio::net::TcpListener::bind(&args.server_addr)

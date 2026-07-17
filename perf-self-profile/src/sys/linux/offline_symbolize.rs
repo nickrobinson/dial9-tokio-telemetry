@@ -1,20 +1,20 @@
 //! Linux offline symbolization using blazesym.
 
+use crate::rate_limit::rate_limited;
 use blazesym::symbolize::{Input, Symbolized, Symbolizer, source};
-use dial9_trace_format::{decoder::Decoder, encoder::Encoder};
-use std::collections::{HashMap, HashSet};
+use dial9_trace_format::decoder::Decoder;
+use dial9_trace_format::encoder::{Encoder, FxBuildHasher, FxHashMap};
+use std::collections::HashSet;
 use std::io::{self, Write};
+use std::time::Duration;
+
+type FxHashSet<T> = HashSet<T, FxBuildHasher>;
 
 use super::USER_ADDR_LIMIT;
 use crate::MapsEntry;
 use crate::offline_symbolize::SymbolTableEntry;
 
-/// Strip TBI/MTE tag bits from an aarch64 address.
-///
-/// On Android with MTE or TBI, pointers carry a tag in the top byte
-/// (e.g. `0xb400006fd9572000`). The hardware ignores this byte for
-/// address translation, but the raw value from registers retains it.
-/// Strip before comparing against `USER_ADDR_LIMIT` or matching maps.
+/// Strip aarch64 top-byte pointer tags before map lookup.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn strip_tbi(addr: u64) -> u64 {
@@ -27,40 +27,91 @@ fn strip_tbi(addr: u64) -> u64 {
     addr
 }
 
-pub(crate) fn write_symbol_data(
+/// Reusable containers for [`write_symbol_data`], avoiding per-call allocations.
+pub(crate) struct SymbolizeContainers {
+    pub(crate) kernel_addrs: Vec<u64>,
+    pub(crate) user_groups: FxHashMap<usize, Vec<(u64, u64)>>,
+    pub(crate) offsets: Vec<u64>,
+    pub(crate) addrs: Vec<u64>,
+}
+
+impl SymbolizeContainers {
+    pub(crate) fn new() -> Self {
+        Self {
+            kernel_addrs: Vec::new(),
+            user_groups: FxHashMap::default(),
+            offsets: Vec::new(),
+            addrs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.kernel_addrs.clear();
+        self.user_groups.clear();
+        self.offsets.clear();
+        self.addrs.clear();
+    }
+}
+
+/// Construct a one-shot [`Symbolizer`] and run [`write_symbol_data`].
+///
+/// Used by [`crate::offline_symbolize::symbolize_trace_with_maps`], which
+/// is the legacy single-call API. Each call pays the full ELF/DWARF parse
+/// cost. Callers symbolizing many segments should prefer
+/// [`crate::offline_symbolize::OfflineSymbolizer`], which keeps a long-lived
+/// `Symbolizer` and amortises the cost across calls.
+pub(crate) fn symbolize_one_shot(
     decoder: Decoder<'_>,
-    addresses: &HashSet<u64>,
+    addresses: &FxHashSet<u64>,
     maps: &[MapsEntry],
     output: &mut impl Write,
 ) -> io::Result<()> {
-    let mut encoder = decoder.into_encoder(output);
-    // TODO: avoid recreating the Symbolizer here every time. This is a little non trivial because of threading issues and Symbolizer being !Send and !Sync.
-    // We need to basically have a background symbolization thread.
     let symbolizer = Symbolizer::new();
+    let mut containers = SymbolizeContainers::new();
+    write_symbol_data(
+        decoder,
+        addresses,
+        maps,
+        &symbolizer,
+        &mut containers,
+        output,
+    )
+}
+
+pub(crate) fn write_symbol_data(
+    decoder: Decoder<'_>,
+    addresses: &FxHashSet<u64>,
+    maps: &[MapsEntry],
+    symbolizer: &Symbolizer,
+    containers: &mut SymbolizeContainers,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    let mut encoder = decoder.into_encoder(output);
 
     if maps.is_empty() {
-        tracing::warn!(
-            "symbolize: /proc/self/maps returned no executable mappings, \
-             skipping symbolization"
-        );
+        rate_limited!(Duration::from_secs(60), {
+            tracing::warn!(
+                "symbolize: /proc/self/maps returned no executable mappings, skipping symbolization"
+            );
+        });
     }
 
     // Partition addresses into kernel vs userspace, group userspace by mapping.
-    let mut kernel_addrs: Vec<u64> = Vec::new();
-    // (mapping_index, file_offset, original_addr)
-    let mut user_groups: HashMap<usize, Vec<(u64, u64)>> = HashMap::new();
-    let mut unmatched: usize = 0;
-
+    let mut unmatched = 0;
     for &addr in addresses {
         let stripped = strip_tbi(addr);
         if stripped >= USER_ADDR_LIMIT {
-            kernel_addrs.push(addr);
+            containers.kernel_addrs.push(addr);
         } else {
             let mut matched = false;
             for (i, entry) in maps.iter().enumerate() {
                 if stripped >= entry.start && stripped < entry.end {
                     let offset = stripped - entry.start + entry.file_offset;
-                    user_groups.entry(i).or_default().push((offset, addr));
+                    containers
+                        .user_groups
+                        .entry(i)
+                        .or_default()
+                        .push((offset, addr));
                     matched = true;
                     break;
                 }
@@ -81,7 +132,7 @@ pub(crate) fn write_symbol_data(
     }
 
     // Batch-resolve kernel addresses.
-    if !kernel_addrs.is_empty() {
+    if !containers.kernel_addrs.is_empty() {
         let src = source::Source::Kernel(source::Kernel {
             kallsyms: blazesym::MaybeDefault::Default,
             vmlinux: blazesym::MaybeDefault::None,
@@ -89,11 +140,11 @@ pub(crate) fn write_symbol_data(
             debug_syms: false,
             _non_exhaustive: (),
         });
-        if let Ok(results) = symbolizer.symbolize(&src, Input::AbsAddr(&kernel_addrs)) {
-            write_symbolized_batch(&results, &kernel_addrs, &mut encoder)?;
+        if let Ok(results) = symbolizer.symbolize(&src, Input::AbsAddr(&containers.kernel_addrs)) {
+            write_symbolized_batch(&results, &containers.kernel_addrs, &mut encoder)?;
         } else {
             // Fallback: emit unresolved kernel placeholders.
-            for &addr in &kernel_addrs {
+            for &addr in &containers.kernel_addrs {
                 let name = format!("[kernel] {:#x}", addr);
                 let symbol_name = encoder.intern_string(&name)?;
                 let source_file = encoder.intern_string("kernel")?;
@@ -111,23 +162,31 @@ pub(crate) fn write_symbol_data(
     }
 
     // Batch-resolve per ELF mapping.
-    for (map_idx, offsets_and_addrs) in &user_groups {
+    for (map_idx, offsets_and_addrs) in &containers.user_groups {
         let entry = &maps[*map_idx];
-        let offsets: Vec<u64> = offsets_and_addrs.iter().map(|(o, _)| *o).collect();
-        let addrs: Vec<u64> = offsets_and_addrs.iter().map(|(_, a)| *a).collect();
+        containers.offsets.clear();
+        containers.addrs.clear();
+        containers
+            .offsets
+            .extend(offsets_and_addrs.iter().map(|(o, _)| *o));
+        containers
+            .addrs
+            .extend(offsets_and_addrs.iter().map(|(_, a)| *a));
         let src = source::Source::Elf(source::Elf::new(&entry.path));
-        match symbolizer.symbolize(&src, Input::FileOffset(&offsets)) {
+        match symbolizer.symbolize(&src, Input::FileOffset(&containers.offsets)) {
             Ok(results) => {
-                write_symbolized_batch(&results, &addrs, &mut encoder)?;
+                write_symbolized_batch(&results, &containers.addrs, &mut encoder)?;
             }
             Err(err) => {
-                tracing::warn!(
-                    path = %entry.path,
-                    count = addrs.len(),
-                    error = %err,
-                    "failed to symbolize batch for ELF mapping, using placeholders"
-                );
-                for &addr in &addrs {
+                rate_limited!(Duration::from_secs(60), {
+                    tracing::warn!(
+                        path = %entry.path,
+                        count = containers.addrs.len(),
+                        error = %err,
+                        "failed to symbolize batch for ELF mapping, using placeholders"
+                    );
+                });
+                for &addr in &containers.addrs {
                     let name = format!("[symbolize-failed] {:#x}", addr);
                     let symbol_name = encoder.intern_string(&name)?;
                     let source_file = encoder.intern_string(&entry.path)?;
@@ -157,8 +216,6 @@ fn write_symbolized_batch(
 ) -> io::Result<()> {
     for (symbolized, &addr) in results.iter().zip(addrs) {
         let Some(sym) = symbolized.as_sym() else {
-            // blazesym couldn't resolve this address — emit a placeholder
-            // so the viewer shows something instead of a raw hex address.
             let name = format!("[unknown] {:#x}", strip_tbi(addr));
             let symbol_name = encoder.intern_string(&name)?;
             let source_file = encoder.intern_string("")?;

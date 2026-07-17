@@ -36,14 +36,41 @@
 //!     println!("ip={:#x} callchain={} frames", sample.ip, sample.callchain.len());
 //! });
 //! ```
-#![cfg(target_arch = "aarch64")]
+//!
+//! ## Memory profiling
+//!
+//! With the `memory-profiling` feature, the `memory_profiling` module adds a
+//! sampled allocation profiler: set `Dial9Allocator` as the global allocator
+//! and register it with a dial9 session via `MemoryProfiler::install`.
+//! Sampled allocations land in the trace as `AllocEvent`/`FreeEvent`.
+//!
+//! ```ignore
+//! use dial9_perf_self_profile::memory_profiling::{Dial9Allocator, MemoryProfiler};
+//!
+//! #[global_allocator]
+//! static ALLOC: Dial9Allocator = Dial9Allocator::system();
+//!
+//! // `handle` is a dial9 session handle (dial9_core::handle::Dial9Handle).
+//! MemoryProfiler::with_defaults().install(handle)?;
+//! ```
 
 pub mod offline_symbolize;
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
+mod rate_limit;
 mod sampler;
 mod symbolize;
 mod sys;
 pub mod tracepoint;
 pub mod unwinder;
+
+#[cfg(feature = "dial9-source")]
+pub mod cpu_source;
+
+#[cfg(feature = "memory-profiling")]
+pub mod memory_profiling;
 
 pub use offline_symbolize::SymbolTableEntry;
 pub use sampler::{EventSource, Sample, SamplerConfig, SamplingMode};
@@ -55,9 +82,15 @@ pub use sys::PerfSampler;
 pub use sys::resolve_symbol;
 
 // ctimer fallback status and thread registration
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 pub use sys::is_ctimer_active;
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+)))]
 pub fn is_ctimer_active() -> bool {
     false
 }
@@ -66,7 +99,10 @@ pub fn is_ctimer_active() -> bool {
 ///
 /// No-op unless ctimer fallback is active (perf uses `inherit` instead).
 pub fn register_current_thread() -> Result<(), std::io::Error> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ))]
     if is_ctimer_active() {
         return crate::sys::fp_profiler::ctimer::register_thread();
     }
@@ -77,18 +113,41 @@ pub fn register_current_thread() -> Result<(), std::io::Error> {
 ///
 /// No-op unless ctimer fallback is active.
 pub fn unregister_current_thread() {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ))]
     if is_ctimer_active() {
         crate::sys::fp_profiler::ctimer::unregister_thread();
     }
 }
 
 // blazesym-dependent APIs
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "android", target_arch = "aarch64")
+))]
 pub use sys::{resolve_symbol_with_maps, resolve_symbols_with_maps};
 
+#[cfg(feature = "dial9-source")]
+pub use cpu_source::{
+    CpuProfiler, CpuProfilingConfig, CpuSampleSource, SchedEventConfig, SchedProfiler,
+};
+
+#[cfg(feature = "memory-profiling")]
+pub use memory_profiling::{
+    AllocEvent, DEFAULT_RING_CAPACITY, DEFAULT_SAMPLE_RATE_BYTES, Dial9Allocator, FreeEvent,
+    InstallError, MemoryProfiler, MemoryProfilerGuard, MemoryProfilingConfig, is_installed,
+};
+
 /// Internal module exposed only for benchmarks. Not part of the public API.
-#[cfg(all(any(target_os = "linux", target_os = "android"), feature = "__internal-bench"))]
+#[cfg(all(
+    any(
+        target_os = "linux",
+        all(target_os = "android", target_arch = "aarch64")
+    ),
+    feature = "__internal-bench"
+))]
 #[doc(hidden)]
 pub mod __bench_internals {
     pub use crate::sys::fp_profiler::install_handler;

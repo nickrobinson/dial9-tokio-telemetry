@@ -1,12 +1,14 @@
 //! Integration tests: in-process worker lifecycle and end-to-end S3 upload.
 #![cfg(feature = "worker-s3")]
 
+mod common;
 mod fake_s3;
 
 use aws_config::Region;
 use aws_sdk_s3::Client;
+use common::{fast_sealing_writer, wait_for_sealed_segment};
 use dial9_tokio_telemetry::background_task::s3::S3Config;
-use dial9_tokio_telemetry::telemetry::{RotatingWriter, TraceWriter, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::{DiskWriter, TracedRuntime};
 use fake_s3::{
     fake_s3_client, fake_s3_client_always_failing, fake_s3_client_flaky, fake_s3_client_hanging,
     fake_s3_client_with_region,
@@ -23,7 +25,6 @@ fn dummy_s3(s3_root: &std::path::Path) -> (S3Config, aws_sdk_s3::Client) {
         .bucket("dummy-bucket")
         .service_name("test")
         .instance_path("test")
-        .boot_id("test")
         .region("us-east-1")
         .build();
     (s3_config, fake_s3_client(s3_root))
@@ -35,7 +36,7 @@ fn worker_thread_starts_and_stops_cleanly() {
     let s3_root = tempfile::tempdir().unwrap();
     let trace_path = trace_dir.path().join("trace.bin");
 
-    let writer = RotatingWriter::new(&trace_path, 1024, 10 * 1024).unwrap();
+    let writer = DiskWriter::new(&trace_path, 1024, 10 * 1024).unwrap();
     let (s3_config, client) = dummy_s3(s3_root.path());
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -63,7 +64,7 @@ fn graceful_shutdown_seals_segments() {
     let s3_root = tempfile::tempdir().unwrap();
     let trace_path = trace_dir.path().join("trace.bin");
 
-    let writer = RotatingWriter::new(&trace_path, 1024, 10 * 1024).unwrap();
+    let writer = DiskWriter::new(&trace_path, 1024, 10 * 1024).unwrap();
     let (s3_config, client) = dummy_s3(s3_root.path());
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -78,7 +79,7 @@ fn graceful_shutdown_seals_segments() {
         .unwrap();
 
     drop(runtime);
-    let result = guard.graceful_shutdown(std::time::Duration::from_secs(5));
+    let result = guard.graceful_shutdown(std::time::Duration::from_secs(1));
 
     assert!(result.is_ok());
 
@@ -90,12 +91,12 @@ fn graceful_shutdown_seals_segments() {
     assert!(active_files.is_empty(), "no .active files should remain");
 }
 
-/// End-to-end: TracedRuntime → RotatingWriter → rotation → worker uploads to
-/// s3s → download from s3s → decompress → parse with TraceReader → verify
+/// End-to-end: TracedRuntime → DiskWriter → rotation → worker uploads to
+/// s3s → download from s3s → decompress → parse with serde decoder → verify
 /// real trace events are present.
 #[test]
 fn end_to_end_trace_to_s3_roundtrip() {
-    use dial9_tokio_telemetry::analysis_unstable::TraceReader;
+    use dial9_trace_format::decoder::Decoder;
 
     let s3_root = tempfile::tempdir().unwrap();
     let trace_dir = tempfile::tempdir().unwrap();
@@ -107,7 +108,7 @@ fn end_to_end_trace_to_s3_roundtrip() {
     let client = fake_s3_client(s3_root.path());
 
     // Small max_file_size to force rotation quickly
-    let mut writer = RotatingWriter::new(&trace_path, 512, 50 * 1024).unwrap();
+    let mut writer = DiskWriter::new(&trace_path, 512, 50 * 1024).unwrap();
     writer.update_segment_metadata(vec![("custom-metadata".to_string(), "value".to_string())]);
 
     let s3_config = S3Config::builder()
@@ -115,7 +116,6 @@ fn end_to_end_trace_to_s3_roundtrip() {
         .prefix("traces")
         .service_name("test-svc")
         .instance_path("us-east-1/test-host")
-        .boot_id("test-boot-id")
         .region("us-east-1")
         .build();
 
@@ -145,7 +145,9 @@ fn end_to_end_trace_to_s3_roundtrip() {
     });
 
     drop(runtime);
-    guard.graceful_shutdown(Duration::from_secs(1)).unwrap();
+    guard
+        .graceful_shutdown(Duration::from_secs(1))
+        .expect("clean shutdown");
 
     // List objects in the bucket — should have at least one uploaded segment
     let list_rt = tokio::runtime::Builder::new_current_thread()
@@ -193,13 +195,45 @@ fn end_to_end_trace_to_s3_roundtrip() {
         std::fs::write(&downloaded_path, &decompressed).unwrap();
     });
 
-    // Parse the downloaded trace with TraceReader
-    let reader = TraceReader::new(downloaded_path.to_str().unwrap()).unwrap();
-    let metadata = reader
-        .segment_metadata
-        .clone()
-        .into_iter()
-        .collect::<HashMap<String, String>>();
+    // Parse the downloaded trace with serde decoder
+    let trace_data = std::fs::read(&downloaded_path).unwrap();
+    let mut dec = Decoder::new(&trace_data).unwrap();
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, clippy::enum_variant_names)]
+    #[serde(tag = "event")]
+    enum S3Event {
+        SegmentMetadataEvent {
+            entries: HashMap<String, String>,
+        },
+        PollStartEvent {
+            timestamp_ns: u64,
+        },
+        PollEndEvent {
+            timestamp_ns: u64,
+        },
+        WorkerParkEvent {
+            timestamp_ns: u64,
+        },
+        #[serde(other)]
+        Other,
+    }
+
+    let mut all_events = Vec::new();
+    dec.for_each_event(|raw| {
+        let ev: S3Event = raw.deserialize().expect("deserialize");
+        all_events.push(ev);
+    })
+    .unwrap();
+
+    let metadata: HashMap<String, String> = all_events
+        .iter()
+        .filter_map(|e| match e {
+            S3Event::SegmentMetadataEvent { entries } => Some(entries.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     assert_eq!(metadata["bucket"], "test-bucket");
     assert_eq!(metadata["service_name"], "test-svc");
     assert_eq!(
@@ -207,18 +241,24 @@ fn end_to_end_trace_to_s3_roundtrip() {
         "expected eagerly populated worker IDs"
     );
     assert_eq!(metadata["custom-metadata"], "value");
-    let events = &reader.runtime_events;
+    let runtime_events: Vec<_> = all_events
+        .iter()
+        .filter(|e| !matches!(e, S3Event::Other | S3Event::SegmentMetadataEvent { .. }))
+        .collect();
     assert!(
-        !events.is_empty(),
+        !runtime_events.is_empty(),
         "expected trace events in downloaded segment, got none"
     );
 
     // Should contain at least some PollStart/PollEnd or WorkerPark events
-    let has_runtime_events = events.iter().any(|e| e.timestamp_nanos().is_some());
     assert!(
-        has_runtime_events,
-        "expected runtime events with timestamps, found none in {} events",
-        events.len()
+        runtime_events.iter().any(|e| matches!(
+            e,
+            S3Event::PollStartEvent { .. }
+                | S3Event::PollEndEvent { .. }
+                | S3Event::WorkerParkEvent { .. }
+        )),
+        "expected runtime events with timestamps"
     );
 }
 
@@ -226,7 +266,7 @@ fn end_to_end_trace_to_s3_roundtrip() {
 /// and corrects the client, even when the initial client has the wrong region.
 #[test]
 fn region_auto_detection_corrects_wrong_client_region() {
-    use dial9_tokio_telemetry::analysis_unstable::TraceReader;
+    use dial9_trace_format::decoder::Decoder;
 
     let s3_root = tempfile::tempdir().unwrap();
     let trace_dir = tempfile::tempdir().unwrap();
@@ -246,7 +286,7 @@ fn region_auto_detection_corrects_wrong_client_region() {
             .build(),
     );
 
-    let writer = RotatingWriter::new(&trace_path, 512, 50 * 1024).unwrap();
+    let writer = DiskWriter::new(&trace_path, 512, 50 * 1024).unwrap();
 
     // Do NOT set .region() — force auto-detection.
     let s3_config = S3Config::builder()
@@ -254,7 +294,6 @@ fn region_auto_detection_corrects_wrong_client_region() {
         .prefix("traces")
         .service_name("test-svc")
         .instance_path("test-host")
-        .boot_id("test-boot-id")
         .build();
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -275,7 +314,9 @@ fn region_auto_detection_corrects_wrong_client_region() {
     });
 
     drop(runtime);
-    guard.graceful_shutdown(Duration::from_secs(1)).unwrap();
+    guard
+        .graceful_shutdown(Duration::from_secs(1))
+        .expect("clean shutdown");
 
     // Verify objects were uploaded despite the wrong initial region.
     let list_rt = tokio::runtime::Builder::new_current_thread()
@@ -318,10 +359,15 @@ fn region_auto_detection_corrects_wrong_client_region() {
         std::fs::write(&downloaded_path, &decompressed).unwrap();
     });
 
-    let reader = TraceReader::new(downloaded_path.to_str().unwrap()).unwrap();
-    let events = &reader.runtime_events;
+    let trace_data = std::fs::read(&downloaded_path).unwrap();
+    let mut dec = Decoder::new(&trace_data).unwrap();
+    let mut event_count = 0usize;
+    dec.for_each_event(|_raw| {
+        event_count += 1;
+    })
+    .unwrap();
     assert!(
-        !events.is_empty(),
+        event_count > 0,
         "expected trace events after region correction"
     );
 }
@@ -341,7 +387,7 @@ fn region_auto_detection_corrects_wrong_client_region() {
 /// the worker would pick up any leftover segments.
 #[test]
 fn stress_test_all_segments_uploaded_and_valid() {
-    use dial9_tokio_telemetry::analysis_unstable::TraceReader;
+    use dial9_trace_format::decoder::Decoder;
 
     let s3_root = tempfile::tempdir().unwrap();
     let trace_dir = tempfile::tempdir().unwrap();
@@ -353,14 +399,13 @@ fn stress_test_all_segments_uploaded_and_valid() {
     // Small segments to force rotations, but not so many that drain takes forever.
     let segment_size = 64 * 1024;
     let total_size = 2 * 1024 * 1024; // 2 MB disk budget
-    let writer = RotatingWriter::new(&trace_path, segment_size, total_size).unwrap();
+    let writer = DiskWriter::new(&trace_path, segment_size, total_size).unwrap();
 
     let s3_config = S3Config::builder()
         .bucket("stress-bucket")
         .prefix("traces")
         .service_name("stress-svc")
         .instance_path("test-host")
-        .boot_id("stress-boot")
         .region("us-east-1")
         .build();
 
@@ -382,7 +427,7 @@ fn stress_test_all_segments_uploaded_and_valid() {
         .build_and_start(builder, writer)
         .unwrap();
 
-    let handle = guard.handle();
+    let handle = guard.tokio_handle(runtime.handle());
 
     // Generate load for 1 second — enough to produce several segments at 64KB each.
     runtime.block_on(async {
@@ -483,8 +528,13 @@ fn stress_test_all_segments_uploaded_and_valid() {
         // Parseable trace events.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &decompressed).unwrap();
-        let reader = TraceReader::new(tmp.path().to_str().unwrap()).unwrap();
-        let segment_events = reader.all_events.len();
+        let trace_data = std::fs::read(tmp.path()).unwrap();
+        let mut dec = Decoder::new(&trace_data).expect("valid trace header");
+        let mut segment_events = 0usize;
+        dec.for_each_event(|_raw| {
+            segment_events += 1;
+        })
+        .unwrap();
         assert!(segment_events > 0, "expected events in {key}, got none");
         total_events += segment_events;
     }
@@ -562,14 +612,13 @@ fn graceful_shutdown_completes_when_s3_hangs() {
     let client = fake_s3_client_hanging(s3_root.path());
 
     // Small segments to force rotation quickly.
-    let writer = RotatingWriter::new(&trace_path, 512, 50 * 1024).unwrap();
+    let writer = DiskWriter::new(&trace_path, 512, 50 * 1024).unwrap();
 
     let s3_config = S3Config::builder()
         .bucket("hang-bucket")
         .prefix("traces")
         .service_name("test-svc")
         .instance_path("test-host")
-        .boot_id("test-boot")
         .region("us-east-1")
         .build();
 
@@ -585,7 +634,7 @@ fn graceful_shutdown_completes_when_s3_hangs() {
         .unwrap();
 
     // Generate trace data on the TracedRuntime, then let the worker pick it up.
-    let handle = guard.handle();
+    let handle = guard.tokio_handle(runtime.handle());
     runtime.block_on(async {
         for _ in 0..50 {
             handle.spawn(async { tokio::task::yield_now().await });
@@ -633,14 +682,13 @@ fn stress_test_with_s3_failures() {
 
     let segment_size = 64 * 1024;
     let total_size = 2 * 1024 * 1024;
-    let writer = RotatingWriter::new(&trace_path, segment_size, total_size).unwrap();
+    let writer = DiskWriter::new(&trace_path, segment_size, total_size).unwrap();
 
     let s3_config = S3Config::builder()
         .bucket("flaky-bucket")
         .prefix("traces")
         .service_name("flaky-svc")
         .instance_path("test-host")
-        .boot_id("flaky-boot")
         .region("us-east-1")
         .build();
 
@@ -656,7 +704,7 @@ fn stress_test_with_s3_failures() {
         .build_and_start(builder, writer)
         .unwrap();
 
-    let handle = guard.handle();
+    let handle = guard.tokio_handle(runtime.handle());
 
     runtime.block_on(async {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -716,14 +764,13 @@ fn permanently_broken_s3_produces_failure_metrics() {
     std::fs::create_dir_all(s3_root.path().join("broken-bucket")).unwrap();
     let client = fake_s3_client_always_failing(s3_root.path());
 
-    let writer = RotatingWriter::new(&trace_path, 512, 50 * 1024).unwrap();
+    let writer = DiskWriter::new(&trace_path, 512, 50 * 1024).unwrap();
 
     let s3_config = S3Config::builder()
         .bucket("broken-bucket")
         .prefix("traces")
         .service_name("test-svc")
         .instance_path("test-host")
-        .boot_id("test-boot")
         .region("us-east-1")
         .build();
 
@@ -744,17 +791,28 @@ fn permanently_broken_s3_produces_failure_metrics() {
         .build_and_start(builder, writer)
         .unwrap();
 
-    // Generate enough events to seal at least one segment, then shut down.
+    let has_pipeline_metric = || {
+        inspector
+            .entries()
+            .iter()
+            .any(|e| e.metrics.contains_key("Failure") || e.metrics.contains_key("Success"))
+    };
+
+    // Generate enough events to seal segments, then poll until the worker has
+    // recorded a pipeline (Failure/Success) metric.
     runtime.block_on(async {
         for _ in 0..50 {
             tokio::spawn(async { tokio::task::yield_now().await });
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !has_pipeline_metric() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     });
 
     drop(runtime);
     guard
-        .graceful_shutdown(std::time::Duration::from_secs(5))
+        .graceful_shutdown(std::time::Duration::from_secs(2))
         .expect("graceful shutdown");
 
     let entries = inspector.entries();
@@ -778,5 +836,139 @@ fn permanently_broken_s3_produces_failure_metrics() {
         "all {} entries should be failures when S3 is permanently broken, but {} succeeded",
         pipeline_entries.len(),
         pipeline_entries.len() - failures,
+    );
+}
+
+/// Triggered mode against S3: the pipeline stays parked until a dump is
+/// requested, then uploads the captured segments and writes a per-dump
+/// manifest at `{prefix}/dumps/{dump_id}.json`. Mirrors the continuous-upload
+/// `end_to_end_trace_to_s3_roundtrip` but on the on-demand path.
+#[test]
+fn dump_trigger_uploads_segments_and_writes_manifest() {
+    let s3_root = tempfile::tempdir().unwrap();
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace_path = trace_dir.path().join("trace.bin");
+
+    std::fs::create_dir(s3_root.path().join("dump-bucket")).unwrap();
+    let client = fake_s3_client(s3_root.path());
+
+    let writer = fast_sealing_writer(&trace_path);
+
+    let s3_config = S3Config::builder()
+        .bucket("dump-bucket")
+        .prefix("traces")
+        .service_name("dump-svc")
+        .instance_path("test-host")
+        .region("us-east-1")
+        .build();
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(2).enable_all();
+
+    let (runtime, guard) = TracedRuntime::builder()
+        .with_trace_path(&trace_path)
+        .with_s3_uploader(s3_config.clone())
+        .with_s3_client(client.clone())
+        .with_dump_trigger(|_| {})
+        .with_worker_poll_interval(Duration::from_millis(50))
+        .build_and_start(builder, writer)
+        .unwrap();
+
+    let trigger = guard.handle().dump_trigger().expect("trigger wired");
+
+    // Before any dump, triggered mode must not have uploaded anything.
+    let list_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let list_keys = |prefix: &str| {
+        let prefix = prefix.to_string();
+        list_rt.block_on(async {
+            let resp = client
+                .list_objects_v2()
+                .bucket("dump-bucket")
+                .prefix(&prefix)
+                .send()
+                .await
+                .unwrap();
+            resp.contents
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|o| o.key)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert!(
+        list_keys("traces/").is_empty(),
+        "triggered mode must not upload until a dump is requested"
+    );
+
+    // A triggered worker parks until a dump is requested, so a confirmed-sealed
+    // segment persists and the unbounded `dump_current_data` window is
+    // guaranteed to match it.
+    wait_for_sealed_segment(&runtime, trace_dir.path());
+
+    let receipt = runtime.block_on(async {
+        trigger
+            .dump_current_data()
+            .with_metadata("reason", "test")
+            .await
+            .expect("dump resolves")
+    });
+
+    assert!(
+        receipt.segments_processed > 0,
+        "dump should capture at least one sealed segment"
+    );
+    let dump_id = receipt.dump_id.to_string();
+    let expected_manifest = format!("traces/dumps/{dump_id}.json");
+    assert_eq!(
+        receipt.manifest_key.as_deref(),
+        Some(expected_manifest.as_str()),
+        "receipt names the manifest key"
+    );
+
+    drop(runtime);
+    guard
+        .graceful_shutdown(Duration::from_secs(5))
+        .expect("clean shutdown");
+
+    // The manifest object exists and lists the produced segment keys.
+    let manifest_bytes = list_rt.block_on(async {
+        client
+            .get_object()
+            .bucket("dump-bucket")
+            .key(&expected_manifest)
+            .send()
+            .await
+            .expect("manifest object exists")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes()
+    });
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(manifest["dump_id"], dump_id);
+    let segments = manifest["segments"].as_array().expect("segments array");
+    assert!(!segments.is_empty(), "manifest lists at least one segment");
+
+    // A listed segment object carries the dump-id as user metadata.
+    let first_segment = segments[0].as_str().unwrap().to_string();
+    let meta = list_rt.block_on(async {
+        client
+            .head_object()
+            .bucket("dump-bucket")
+            .key(&first_segment)
+            .send()
+            .await
+            .expect("segment object exists")
+            .metadata
+            .unwrap_or_default()
+    });
+    assert_eq!(
+        meta.get("dump-id").map(String::as_str),
+        Some(dump_id.as_str()),
+        "captured segment is tagged with the dump id"
     );
 }

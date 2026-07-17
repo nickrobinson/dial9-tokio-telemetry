@@ -22,6 +22,14 @@ impl PerfSampler {
         unsupported()
     }
 
+    pub(crate) fn start_perf_only(_config: SamplerConfig) -> io::Result<Self> {
+        unsupported()
+    }
+
+    pub(crate) fn start_ctimer_only(_config: SamplerConfig) -> io::Result<Self> {
+        unsupported()
+    }
+
     pub fn new_per_thread(_config: SamplerConfig) -> io::Result<Self> {
         unsupported()
     }
@@ -47,9 +55,9 @@ impl PerfSampler {
     pub fn enable(&self) {}
 }
 
-pub(crate) fn write_symbol_data(
+pub(crate) fn symbolize_one_shot(
     _decoder: dial9_trace_format::decoder::Decoder<'_>,
-    _addresses: &std::collections::HashSet<u64>,
+    _addresses: &dial9_trace_format::encoder::FxHashSet<u64>,
     _maps: &[crate::MapsEntry],
     _output: &mut impl std::io::Write,
 ) -> std::io::Result<()> {

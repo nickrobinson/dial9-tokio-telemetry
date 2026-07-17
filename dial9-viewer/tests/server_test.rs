@@ -1,6 +1,8 @@
 use assert2::check;
-use dial9_viewer::server::{AppState, router};
-use dial9_viewer::storage::{LocalBackend, ObjectInfo, S3Backend, StorageBackend, StorageError};
+use dial9_viewer::server::{AppState, UploadLimits, router};
+use dial9_viewer::storage::{
+    ListPage, LocalBackend, ObjectInfo, S3Backend, StorageBackend, StorageError,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,7 +11,27 @@ use std::sync::Arc;
 struct FakeBackend;
 
 impl StorageBackend for FakeBackend {
+    fn list_buckets(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
     fn list_objects(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _cap: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPage, StorageError>> + Send + '_>> {
+        Box::pin(async {
+            Ok(ListPage {
+                objects: vec![],
+                truncated: false,
+            })
+        })
+    }
+
+    fn list_objects_all(
         &self,
         _bucket: &str,
         _prefix: &str,
@@ -32,26 +54,108 @@ impl StorageBackend for FakeBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, StorageError>> + Send + '_>> {
         Box::pin(async { Err(StorageError::NotFound("fake".into())) })
     }
+
+    fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 fn fake_s3_client(fs_root: &std::path::Path) -> aws_sdk_s3::Client {
-    let fs = s3s_fs::FileSystem::new(fs_root).unwrap();
-    let mut builder = s3s::service::S3ServiceBuilder::new(fs);
-    builder.set_auth(s3s::auth::SimpleAuth::from_single("test", "test"));
-    let s3_service = builder.build();
-    let s3_client: s3s_aws::Client = s3_service.into();
-
     let s3_config = aws_sdk_s3::Config::builder()
         .behavior_version_latest()
         .credentials_provider(aws_sdk_s3::config::Credentials::new(
             "test", "test", None, None, "test",
         ))
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .http_client(s3_client)
+        .http_client(fake_s3_http_client(fs_root))
         .force_path_style(true)
         .build();
 
     aws_sdk_s3::Client::from_conf(s3_config)
+}
+
+/// Build the s3s-backed HTTP client (without wrapping it in an `aws_sdk_s3`
+/// client). Used both by [`fake_s3_client`] and by the ephemeral
+/// bring-your-own-credentials path, which needs to inject this connector into
+/// `EphemeralS3Config`.
+fn fake_s3_http_client(fs_root: &std::path::Path) -> aws_sdk_s3::config::SharedHttpClient {
+    let fs = s3s_fs::FileSystem::new(fs_root).unwrap();
+    let mut builder = s3s::service::S3ServiceBuilder::new(fs);
+    builder.set_auth(s3s::auth::SimpleAuth::from_single("test", "test"));
+    let s3_service = builder.build();
+    let s3_client: s3s_aws::Client = s3_service.into();
+    aws_sdk_s3::config::SharedHttpClient::new(s3_client)
+}
+
+/// An `EphemeralS3Config` pointed at the s3s fake, so the header → ephemeral
+/// client → fake-S3 path can be exercised in tests.
+fn fake_ephemeral_config(fs_root: &std::path::Path) -> dial9_viewer::storage::EphemeralS3Config {
+    dial9_viewer::storage::EphemeralS3Config {
+        http_client: fake_s3_http_client(fs_root),
+        // s3s ignores the host, but an endpoint is required so the SDK doesn't
+        // try to resolve real S3 DNS.
+        endpoint_url: Some("http://localhost:0".to_string()),
+        force_path_style: true,
+    }
+}
+
+/// A backend that always errors — used to prove a request was served by the
+/// header-supplied ephemeral backend and NOT the server's default backend.
+struct ErroringBackend;
+
+impl StorageBackend for ErroringBackend {
+    fn list_buckets(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
+    fn list_objects(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _cap: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPage, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
+    fn list_objects_all(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
+    fn list_prefixes(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
+    fn get_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
+
+    fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::Other("default backend used".into())) })
+    }
 }
 
 async fn start_server(state: AppState) -> String {
@@ -91,50 +195,6 @@ async fn serves_static_files() {
     check!(resp.status().as_u16() == 200);
     let body = resp.text().await.unwrap();
     check!(body.contains("Trace Viewer"));
-}
-
-#[tokio::test]
-async fn search_requires_bucket() {
-    let state = AppState::new(Arc::new(FakeBackend), None, None);
-    let base = start_server(state).await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .get(format!("{base}/api/search"))
-        .send()
-        .await
-        .unwrap();
-    check!(resp.status().as_u16() == 400);
-}
-
-#[tokio::test]
-async fn search_uses_default_bucket() {
-    let state = AppState::new(Arc::new(FakeBackend), Some("my-bucket".into()), None);
-    let base = start_server(state).await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .get(format!("{base}/api/search"))
-        .send()
-        .await
-        .unwrap();
-    check!(resp.status().as_u16() == 200);
-    let body: Vec<ObjectInfo> = resp.json().await.unwrap();
-    check!(body.is_empty());
-}
-
-#[tokio::test]
-async fn trace_requires_keys() {
-    let state = AppState::new(Arc::new(FakeBackend), Some("test-bucket".into()), None);
-    let base = start_server(state).await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .get(format!("{base}/api/trace?keys=&bucket=test-bucket"))
-        .send()
-        .await
-        .unwrap();
-    check!(resp.status().as_u16() == 400);
 }
 
 #[tokio::test]
@@ -215,7 +275,8 @@ async fn setup_s3_test(
     // but they share the same filesystem root)
     let backend = S3Backend::from_client(fake_s3_client(s3_root.path()));
 
-    let state = AppState::new(Arc::new(backend), default_bucket, default_prefix);
+    let state =
+        AppState::new(Arc::new(backend), default_bucket, default_prefix).with_byo_creds(true);
     let base = start_server(state).await;
     (upload_client, base, s3_root)
 }
@@ -240,123 +301,45 @@ async fn prefixes_discovers_top_level_prefixes() {
     check!(resp.contains(&"logs/".to_string()));
 }
 
+// --- /api/object (raw single-object passthrough) tests ---
+
+/// The defining property of /api/object: it serves a `.bin.gz` object's bytes
+/// VERBATIM, still gzipped — it must NOT decompress (that's the browser's job
+/// via fetchTraces).
 #[tokio::test]
-async fn search_returns_objects_from_s3() {
-    let (s3, base, _dir) = setup_s3_test("test-bucket", None, None).await;
+async fn object_serves_raw_gzipped_bytes() {
+    let (s3, base, _dir) = setup_s3_test("obj-bucket", Some("obj-bucket".into()), None).await;
     let client = reqwest::Client::new();
 
-    put_object(
-        &s3,
-        "test-bucket",
-        "traces/2026-04-09/1910/svc/host/123-0.bin.gz",
-        &gzip_bytes(b"trace data 1"),
-    )
-    .await;
-    put_object(
-        &s3,
-        "test-bucket",
-        "traces/2026-04-09/1910/svc/host/123-1.bin.gz",
-        &gzip_bytes(b"trace data 2"),
-    )
-    .await;
-    put_object(
-        &s3,
-        "test-bucket",
-        "traces/2026-04-09/1920/svc/host/456-0.bin.gz",
-        &gzip_bytes(b"other data"),
-    )
-    .await;
+    let plaintext = b"DECOMPRESSED_TRACE_BODY";
+    let gzipped = gzip_bytes(plaintext);
+    put_object(&s3, "obj-bucket", "seg.bin.gz", &gzipped).await;
 
-    // Search with prefix matching the 1910 time bucket
     let resp = client
-        .get(format!(
-            "{base}/api/search?q=traces/2026-04-09/1910/&bucket=test-bucket"
-        ))
+        .get(format!("{base}/api/object?key=seg.bin.gz"))
         .send()
         .await
         .unwrap();
     check!(resp.status().as_u16() == 200);
-    let body: Vec<ObjectInfo> = resp.json().await.unwrap();
-    check!(body.len() == 2);
-    check!(body[0].key.contains("1910"));
-    check!(body[1].key.contains("1910"));
-
-    // Search with broader prefix returns all 3
-    let resp = client
-        .get(format!(
-            "{base}/api/search?q=traces/2026-04-09/&bucket=test-bucket"
-        ))
-        .send()
-        .await
-        .unwrap();
-    let body: Vec<ObjectInfo> = resp.json().await.unwrap();
-    check!(body.len() == 3);
-}
-
-#[tokio::test]
-async fn search_with_default_prefix() {
-    let (s3, base, _dir) = setup_s3_test(
-        "test-bucket",
-        Some("test-bucket".into()),
-        Some("my-prefix".into()),
-    )
-    .await;
-    let client = reqwest::Client::new();
-
-    put_object(
-        &s3,
-        "test-bucket",
-        "my-prefix/2026-04-09/1910/svc/host/123-0.bin.gz",
-        b"data",
-    )
-    .await;
-
-    let resp = client
-        .get(format!("{base}/api/search?q=2026-04-09/"))
-        .send()
-        .await
-        .unwrap();
-    check!(resp.status().as_u16() == 200);
-    let body: Vec<ObjectInfo> = resp.json().await.unwrap();
-    check!(body.len() == 1);
-    check!(body[0].key.contains("my-prefix"));
-}
-
-#[tokio::test]
-async fn trace_fetches_and_concatenates() {
-    let (s3, base, _dir) = setup_s3_test("test-bucket", Some("test-bucket".into()), None).await;
-    let client = reqwest::Client::new();
-
-    let trace1 = b"TRACE_SEGMENT_1_DATA";
-    let trace2 = b"TRACE_SEGMENT_2_DATA";
-
-    put_object(&s3, "test-bucket", "seg1.bin.gz", &gzip_bytes(trace1)).await;
-    put_object(&s3, "test-bucket", "seg2.bin.gz", &gzip_bytes(trace2)).await;
-
-    let resp = client
-        .get(format!(
-            "{base}/api/trace?keys=seg1.bin.gz&keys=seg2.bin.gz"
-        ))
-        .send()
-        .await
-        .unwrap();
-    check!(resp.status().as_u16() == 200);
-
     let body = resp.bytes().await.unwrap();
-    let expected: Vec<u8> = [trace1.as_slice(), trace2.as_slice()].concat();
-    check!(body.as_ref() == expected.as_slice());
+    // Bytes are the raw gzip stream, NOT the decompressed plaintext.
+    check!(body.as_ref() == gzipped.as_slice());
+    check!(body.as_ref() != plaintext.as_slice());
+    // Sanity: a gzip stream starts with the 0x1f 0x8b magic.
+    check!(body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b);
 }
 
+/// An uncompressed object is returned verbatim too.
 #[tokio::test]
-async fn trace_single_key() {
-    let (s3, base, _dir) = setup_s3_test("trace-bucket", Some("trace-bucket".into()), None).await;
+async fn object_serves_uncompressed_bytes() {
+    let (s3, base, _dir) = setup_s3_test("obj-bucket", Some("obj-bucket".into()), None).await;
     let client = reqwest::Client::new();
 
-    let data = b"single segment data";
-    put_object(&s3, "trace-bucket", "key.bin.gz", &gzip_bytes(data)).await;
+    let data = b"raw uncompressed object";
+    put_object(&s3, "obj-bucket", "raw.bin", data).await;
 
     let resp = client
-        .get(format!("{base}/api/trace?keys=key.bin.gz"))
+        .get(format!("{base}/api/object?key=raw.bin"))
         .send()
         .await
         .unwrap();
@@ -365,118 +348,561 @@ async fn trace_single_key() {
     check!(body.as_ref() == data);
 }
 
+/// A large object must stream back byte-for-byte intact. Because the handler
+/// now uses `Body::from_stream` instead of buffering, this exercises the
+/// multi-chunk path: the s3s fake delivers the body in several `ByteStream`
+/// chunks and they must reassemble exactly. Kept to a few MB so it stays cheap.
 #[tokio::test]
-async fn trace_handles_uncompressed_data() {
-    let (s3, base, _dir) = setup_s3_test("trace-bucket", Some("trace-bucket".into()), None).await;
+async fn object_streams_large_object_intact() {
+    let (s3, base, _dir) = setup_s3_test("obj-bucket", Some("obj-bucket".into()), None).await;
     let client = reqwest::Client::new();
 
-    let data = b"raw uncompressed trace";
-    put_object(&s3, "trace-bucket", "raw.bin", data).await;
+    // 4MB of non-trivial bytes so a single read can't accidentally satisfy it.
+    let big: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    put_object(&s3, "obj-bucket", "big.bin", &big).await;
 
     let resp = client
-        .get(format!("{base}/api/trace?keys=raw.bin"))
+        .get(format!("{base}/api/object?key=big.bin"))
         .send()
         .await
         .unwrap();
     check!(resp.status().as_u16() == 200);
     let body = resp.bytes().await.unwrap();
-    check!(body.as_ref() == data);
+    check!(body.len() == big.len());
+    check!(body.as_ref() == big.as_slice());
 }
 
-/// Full end-to-end smoke test: simulates the browser flow.
-/// 1. Upload gzipped trace segments to fake S3
-/// 2. Search for them via /api/search
-/// 3. Pick keys from the search results
-/// 4. Fetch concatenated trace via /api/trace
-/// 5. Verify the concatenated output matches the original data
 #[tokio::test]
-async fn e2e_search_then_view() {
+async fn object_requires_key() {
+    let state = AppState::new(Arc::new(FakeBackend), Some("test-bucket".into()), None);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/object?key=&bucket=test-bucket"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+/// BYO credentials: /api/object must be served by the header-supplied ephemeral
+/// backend (the s3s fake), not the erroring default backend.
+#[tokio::test]
+async fn byo_credentials_serve_object_from_headers() {
+    let (s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let client = reqwest::Client::new();
+
+    let data = b"BYO_OBJECT_BYTES";
+    let gzipped = gzip_bytes(data);
+    put_object(&s3, "byo-bucket", "seg.bin.gz", &gzipped).await;
+
+    let resp = client
+        .get(format!(
+            "{base}/api/object?key=seg.bin.gz&bucket=byo-bucket"
+        ))
+        .header(H_AKID, "test")
+        .header(H_SECRET, "test")
+        .header(H_REGION, "us-east-1")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body = resp.bytes().await.unwrap();
+    // Served raw (still gzipped) by the ephemeral backend.
+    check!(body.as_ref() == gzipped.as_slice());
+}
+
+/// `/api/browse` must fan a window out across the finer time buckets that
+/// cover it and merge the results. This is the fix for the silent-truncation
+/// bug: the browser used to query one *hour* prefix per hour, overflowing the
+/// listing cap on busy hours. Here three segments land in two different
+/// 10-minute buckets (1910 and 1925) within the same window; a single browse
+/// call must return all three.
+#[tokio::test]
+async fn browse_fans_out_across_time_buckets() {
     let (s3, base, _dir) = setup_s3_test("traces-bucket", Some("traces-bucket".into()), None).await;
     let client = reqwest::Client::new();
 
-    // Simulate two trace segments from the same time bucket
-    let seg1 = b"SEGMENT_ONE_BINARY_DATA_HERE";
-    let seg2 = b"SEGMENT_TWO_BINARY_DATA_HERE";
-
+    // 2026-04-09 19:10:00Z .. 19:25:00Z — keys use {date}/{HHMM}/...
     put_object(
         &s3,
         "traces-bucket",
-        "2026-04-09/1910/checkout-api/us-east-1/host1/1000-0.bin.gz",
-        &gzip_bytes(seg1),
+        "2026-04-09/1910/svc/hostA/1000-0.bin.gz",
+        &gzip_bytes(b"a"),
     )
     .await;
     put_object(
         &s3,
         "traces-bucket",
-        "2026-04-09/1910/checkout-api/us-east-1/host1/1000-1.bin.gz",
-        &gzip_bytes(seg2),
+        "2026-04-09/1912/svc/hostB/1001-0.bin.gz",
+        &gzip_bytes(b"b"),
+    )
+    .await;
+    put_object(
+        &s3,
+        "traces-bucket",
+        "2026-04-09/1925/svc/hostC/1002-0.bin.gz",
+        &gzip_bytes(b"c"),
+    )
+    .await;
+    // Outside the window — must NOT be returned.
+    put_object(
+        &s3,
+        "traces-bucket",
+        "2026-04-09/2010/svc/hostD/1003-0.bin.gz",
+        &gzip_bytes(b"d"),
     )
     .await;
 
-    // Step 1: Search — like the browser would
-    let search_resp: Vec<ObjectInfo> = client
+    // 19:08:00Z .. 19:30:00Z (epoch seconds). Spans the 1910 and 1920 ten-minute
+    // buckets; the 20:10 segment is an hour later and excluded.
+    let from = 1_775_761_680; // 2026-04-09T19:08:00Z
+    let to = from + 22 * 60; // 19:30:00Z
+    let resp = client
         .get(format!(
-            "{base}/api/search?q=2026-04-09/1910/checkout-api/&bucket=traces-bucket"
+            "{base}/api/browse?bucket=traces-bucket&from={from}&to={to}"
         ))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let objects = body["objects"].as_array().unwrap();
+    check!(objects.len() == 3);
+    check!(body["truncated"] == false);
+    let keys: Vec<&str> = objects.iter().map(|o| o["key"].as_str().unwrap()).collect();
+    check!(keys.iter().any(|k| k.contains("1910")));
+    check!(keys.iter().any(|k| k.contains("1912")));
+    check!(keys.iter().any(|k| k.contains("1925")));
+    check!(!keys.iter().any(|k| k.contains("2010")));
+}
+
+/// `/api/browse` combines the server's default prefix with the request's
+/// `prefix` param.
+#[tokio::test]
+async fn browse_honors_default_and_request_prefix() {
+    let (s3, base, _dir) = setup_s3_test(
+        "test-bucket",
+        Some("test-bucket".into()),
+        Some("root".into()),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    put_object(
+        &s3,
+        "test-bucket",
+        "root/team-a/2026-04-09/1910/svc/host/1000-0.bin.gz",
+        &gzip_bytes(b"a"),
+    )
+    .await;
+    // Different sub-prefix under the same default — must be excluded by `prefix`.
+    put_object(
+        &s3,
+        "test-bucket",
+        "root/team-b/2026-04-09/1910/svc/host/1000-0.bin.gz",
+        &gzip_bytes(b"b"),
+    )
+    .await;
+
+    let from = 1_775_761_680; // 19:08:00Z
+    let to = from + 22 * 60;
+    let resp = client
+        .get(format!(
+            "{base}/api/browse?bucket=test-bucket&prefix=team-a&from={from}&to={to}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let objects = body["objects"].as_array().unwrap();
+    check!(objects.len() == 1);
+    check!(objects[0]["key"].as_str().unwrap().contains("team-a"));
+}
+
+/// A focus window under 10 minutes drops to minute-granularity prefixes. A
+/// 4-char `HHMM` prefix is exact, so a segment in an adjacent minute outside
+/// the window is not even listed.
+#[tokio::test]
+async fn browse_uses_minute_granularity_for_short_window() {
+    let (s3, base, _dir) = setup_s3_test("traces-bucket", Some("traces-bucket".into()), None).await;
+    let client = reqwest::Client::new();
+
+    put_object(
+        &s3,
+        "traces-bucket",
+        "2026-04-09/1910/svc/host/1000-0.bin.gz",
+        &gzip_bytes(b"a"),
+    )
+    .await;
+    put_object(
+        &s3,
+        "traces-bucket",
+        "2026-04-09/1911/svc/host/1001-0.bin.gz",
+        &gzip_bytes(b"b"),
+    )
+    .await;
+
+    // 19:10:00Z .. 19:10:30Z — a 30s window, well under the 10-minute threshold.
+    let from = 1_775_761_680 + 2 * 60; // 19:10:00Z
+    let to = from + 30; // 19:10:30Z
+    let resp = client
+        .get(format!(
+            "{base}/api/browse?bucket=traces-bucket&from={from}&to={to}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let objects = body["objects"].as_array().unwrap();
+    // Only the 1910 minute bucket is scanned; 1911 is never listed.
+    check!(objects.len() == 1);
+    check!(objects[0]["key"].as_str().unwrap().contains("1910"));
+}
+
+/// `/api/browse` rejects a window where `to` precedes `from`.
+#[tokio::test]
+async fn browse_rejects_inverted_range() {
+    let state = AppState::new(Arc::new(FakeBackend), Some("b".into()), None);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/browse?from=2000&to=1000"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+/// Regression test for the browse fan-out misattribution bug.
+///
+/// The overflow-collection loop correlates each per-prefix list result with its
+/// prefix by input position (`prefixes[i]`). The fan-out previously used
+/// `buffer_unordered`, which yields results in *completion* order, not input
+/// order. When a later prefix's list completed first, its overflow was
+/// attributed to the *wrong* prefix: the overflowed prefix was never refined,
+/// so its objects silently vanished, while a perfectly fine prefix got
+/// needlessly refined. The fix is `buffered`, which preserves input order.
+///
+/// [`ReorderingBackend`] forces a deterministic completion order that differs
+/// from input order: the second prefix (`…/20`) overflows and completes first;
+/// the first prefix (`…/19`) is gated on a oneshot and only completes after.
+/// Under the bug the overflow is attributed to `…/19`, so `…/20`'s refined
+/// object (under `…/201`) is lost; under the fix it is present.
+struct ReorderingBackend {
+    /// Fires when the "fast" second prefix finishes, releasing the slow first.
+    release_tx: std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    release_rx: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+
+fn obj_info(key: &str) -> ObjectInfo {
+    ObjectInfo {
+        key: key.to_string(),
+        size: 1,
+        last_modified: None,
+    }
+}
+
+impl StorageBackend for ReorderingBackend {
+    fn list_buckets(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn list_objects(
+        &self,
+        _bucket: &str,
+        prefix: &str,
+        _cap: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<ListPage, StorageError>> + Send + '_>> {
+        match prefix {
+            // Second input prefix: overflows at hour granularity and completes
+            // first, releasing the gated first prefix on its way out.
+            "2026-04-09/20" => {
+                let tx = self.release_tx.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(());
+                    }
+                    Ok(ListPage {
+                        objects: vec![],
+                        truncated: true,
+                    })
+                })
+            }
+            // First input prefix: gated so it only completes after the second,
+            // making completion order the reverse of input order.
+            "2026-04-09/19" => {
+                let rx = self.release_rx.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                    Ok(ListPage {
+                        objects: vec![obj_info("2026-04-09/19/svc/host/1000-0.bin.gz")],
+                        truncated: false,
+                    })
+                })
+            }
+            // Refinement of the *correct* overflowed prefix (`…/20`) hits its
+            // ten-minute sub-prefixes; the object lives under `…/201`.
+            "2026-04-09/201" => Box::pin(async {
+                Ok(ListPage {
+                    objects: vec![obj_info("2026-04-09/201/svc/host/2000-0.bin.gz")],
+                    truncated: false,
+                })
+            }),
+            _ => Box::pin(async {
+                Ok(ListPage {
+                    objects: vec![],
+                    truncated: false,
+                })
+            }),
+        }
+    }
+
+    fn list_objects_all(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ObjectInfo>, StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn list_prefixes(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(vec![]) })
+    }
+
+    fn get_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, StorageError>> + Send + '_>> {
+        Box::pin(async { Err(StorageError::NotFound("fake".into())) })
+    }
+
+    fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StorageError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn browse_overflow_attribution_survives_out_of_order_completion() {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let backend = ReorderingBackend {
+        release_tx: std::sync::Mutex::new(Some(tx)),
+        release_rx: std::sync::Mutex::new(Some(rx)),
+    };
+    let state =
+        AppState::new(Arc::new(backend), Some("traces-bucket".into()), None).with_byo_creds(true);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    // 2026-04-09 19:00:00Z .. 20:30:00Z — a 90-minute window, so hour
+    // granularity, producing prefixes [`…/19`, `…/20`].
+    let from = 1_775_761_200; // 2026-04-09T19:00:00Z
+    let to = from + 90 * 60; // 20:30:00Z
+    let resp = client
+        .get(format!(
+            "{base}/api/browse?bucket=traces-bucket&from={from}&to={to}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let keys: Vec<&str> = body["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["key"].as_str().unwrap())
+        .collect();
+
+    // The direct (non-overflowed) `…/19` object, and the refined `…/20` object.
+    // Under the old `buffer_unordered`, the overflow was misattributed to `…/19`
+    // and `…/201` was never listed, so this object would be missing.
+    check!(keys.iter().any(|k| k.contains("2026-04-09/19/")));
+    check!(keys.iter().any(|k| k.contains("2026-04-09/201/")));
+    check!(keys.len() == 2);
+    check!(body["truncated"] == false);
+}
+
+// --- bring-your-own-credentials tests ---
+
+const H_AKID: &str = "x-dial9-aws-access-key-id";
+const H_SECRET: &str = "x-dial9-aws-secret-access-key";
+const H_REGION: &str = "x-dial9-aws-region";
+
+/// Set up a BYO server: the default backend always errors, so any successful
+/// data response must have been served by the header-supplied ephemeral
+/// backend pointed at the s3s fake.
+async fn setup_byo_test(bucket: &str) -> (aws_sdk_s3::Client, String, tempfile::TempDir) {
+    let s3_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(s3_root.path().join(bucket)).unwrap();
+
+    let upload_client = fake_s3_client(s3_root.path());
+
+    let state = AppState::new(Arc::new(ErroringBackend), Some(bucket.to_string()), None)
+        .with_byo_creds(true)
+        .with_ephemeral_s3(fake_ephemeral_config(s3_root.path()));
+    let base = start_server(state).await;
+    (upload_client, base, s3_root)
+}
+
+#[tokio::test]
+async fn byo_credentials_list_buckets_from_headers() {
+    // The s3s fake exposes buckets that exist as directories under its root.
+    let (s3, base, dir) = setup_byo_test("byo-bucket").await;
+    // Create a second bucket so the listing returns more than one.
+    std::fs::create_dir(dir.path().join("dial9-traces")).unwrap();
+    // Touch the fake so the dir is recognized as a bucket (PutObject creates it
+    // lazily otherwise); upload into both.
+    put_object(&s3, "byo-bucket", "x", b"x").await;
+
+    let resp = client_list_buckets(&base).await;
+    check!(resp.status().as_u16() == 200);
+    let names: Vec<String> = resp.json().await.unwrap();
+    check!(names.contains(&"byo-bucket".to_string()));
+    check!(names.contains(&"dial9-traces".to_string()));
+}
+
+#[tokio::test]
+async fn credentials_check_succeeds_for_existing_bucket() {
+    // HeadBucket against the s3s fake succeeds for a bucket that exists, so the
+    // check endpoint reports ok:true. (The wrong-credentials → ok:false path is
+    // validated live against real S3; s3s does not enforce sigv4 the same way.)
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/credentials/check?bucket=byo-bucket"))
+        .header(H_AKID, "test")
+        .header(H_SECRET, "test")
+        .header(H_REGION, "us-east-1")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    check!(body["ok"] == true);
+}
+
+#[tokio::test]
+async fn credentials_check_requires_credentials() {
+    // No headers → the check endpoint reports the missing-credentials 400.
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/credentials/check?bucket=byo-bucket"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+#[tokio::test]
+async fn list_buckets_without_credentials_uses_default_backend() {
+    // No headers → the (erroring) default backend, not the ephemeral path.
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/api/buckets"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 500);
+}
+
+/// GET /api/buckets with the s3s test credentials in headers.
+async fn client_list_buckets(base: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .header(H_AKID, "test")
+        .header(H_SECRET, "test")
+        .header(H_REGION, "us-east-1")
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn without_credentials_falls_back_to_default_backend() {
+    // No headers → the (erroring) default backend is used. Proves credentials
+    // are genuinely optional AND that the default path is still taken.
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "{base}/api/browse?prefix=traces/&bucket=byo-bucket&from=0&to=9999999999"
+        ))
+        .send()
+        .await
+        .unwrap();
+    // ErroringBackend → 500, not a 200 from the ephemeral path.
+    check!(resp.status().as_u16() == 500);
+}
+
+#[tokio::test]
+async fn incomplete_credentials_rejected_with_400() {
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let client = reqwest::Client::new();
+
+    // Access key id without a secret → 400, never a silent fallback.
+    let resp = client
+        .get(format!(
+            "{base}/api/browse?prefix=traces/&bucket=byo-bucket&from=0&to=9999999999"
+        ))
+        .header(H_AKID, "test")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+#[tokio::test]
+async fn config_reports_credential_support() {
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let client = reqwest::Client::new();
+
+    let resp: serde_json::Value = client
+        .get(format!("{base}/api/config"))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-
-    check!(search_resp.len() == 2);
-
-    // Step 2: Build the trace URL from search results — like the browser's viewSelected()
-    let keys: Vec<&str> = search_resp.iter().map(|o| o.key.as_str()).collect();
-    let keys_param: String = keys
-        .iter()
-        .map(|k| format!("keys={}", urlencoding::encode(k)))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    let trace_resp = client
-        .get(format!(
-            "{base}/api/trace?{keys_param}&bucket=traces-bucket",
-        ))
-        .send()
-        .await
-        .unwrap();
-
-    check!(trace_resp.status().as_u16() == 200);
-    let body = trace_resp.bytes().await.unwrap();
-
-    // The concatenated output should be seg1 + seg2 (order depends on S3 listing)
-    check!(body.len() == seg1.len() + seg2.len());
-    // Both segments should be present
-    let body_slice = body.as_ref();
-    let has_seg1 = body_slice.windows(seg1.len()).any(|w| w == seg1.as_slice());
-    let has_seg2 = body_slice.windows(seg2.len()).any(|w| w == seg2.as_slice());
-    check!(has_seg1);
-    check!(has_seg2);
+    check!(resp["supports_byo_credentials"] == true);
 }
 
-/// Regression test: a compressed segment that decompresses to >50MB must be
-/// served successfully. Previously, the server truncated at 50MB during
-/// decompression (overshooting by up to 8KB) and then rejected the result
-/// with HTTP 413 because it exceeded the same 50MB limit.
 #[tokio::test]
-async fn trace_serves_large_decompressed_segment() {
-    let (s3, base, _dir) = setup_s3_test("big-bucket", Some("big-bucket".into()), None).await;
+async fn config_reports_no_credential_support_by_default() {
+    // A plain (non-BYO) server should not advertise credential support.
+    let state = AppState::new(Arc::new(FakeBackend), Some("b".into()), None);
+    let base = start_server(state).await;
     let client = reqwest::Client::new();
 
-    // 60MB of data — compresses well, decompresses to >50MB
-    let big_data = vec![0xABu8; 60 * 1024 * 1024];
-    put_object(&s3, "big-bucket", "big.bin.gz", &gzip_bytes(&big_data)).await;
-
-    let resp = client
-        .get(format!("{base}/api/trace?keys=big.bin.gz"))
+    let resp: serde_json::Value = client
+        .get(format!("{base}/api/config"))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    check!(resp.status().as_u16() == 200);
-    let body = resp.bytes().await.unwrap();
-    check!(body.len() == big_data.len());
+    check!(resp["supports_byo_credentials"] == false);
 }
 
 // --- local backend tests ---
@@ -502,82 +928,53 @@ fn local_state(dir: &std::path::Path) -> AppState {
     AppState::new(Arc::new(LocalBackend::new(dir)), Some("local".into()), None)
 }
 
+/// /api/object on the local backend serves the file's raw (gzipped) bytes
+/// without decompressing.
 #[tokio::test]
-async fn local_search_lists_all_files() {
-    let dir = setup_local_dir();
-    let base = start_server(local_state(dir.path())).await;
-    let client = reqwest::Client::new();
-
-    let resp: Vec<ObjectInfo> = client
-        .get(format!("{base}/api/search"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    check!(resp.len() == 3);
-}
-
-#[tokio::test]
-async fn local_search_filters_by_prefix() {
-    let dir = setup_local_dir();
-    let base = start_server(local_state(dir.path())).await;
-    let client = reqwest::Client::new();
-
-    let resp: Vec<ObjectInfo> = client
-        .get(format!("{base}/api/search?q=2026-04-09/1910/"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    check!(resp.len() == 2);
-    for obj in &resp {
-        check!(obj.key.contains("1910"));
-    }
-}
-
-#[tokio::test]
-async fn local_trace_fetches_and_decompresses() {
+async fn local_object_serves_raw_bytes() {
     let dir = setup_local_dir();
     let base = start_server(local_state(dir.path())).await;
     let client = reqwest::Client::new();
 
     let resp = client
         .get(format!(
-            "{base}/api/trace?keys=2026-04-09/1910/svc/host/123-0.bin.gz&keys=2026-04-09/1910/svc/host/123-1.bin.gz"
+            "{base}/api/object?key=2026-04-09/1910/svc/host/123-0.bin.gz"
         ))
         .send()
         .await
         .unwrap();
     check!(resp.status().as_u16() == 200);
     let body = resp.bytes().await.unwrap();
-    // Both segments decompressed and concatenated
-    let body_slice = body.as_ref();
-    let has_seg0 = body_slice
-        .windows(b"trace seg 0".len())
-        .any(|w| w == b"trace seg 0");
-    let has_seg1 = body_slice
-        .windows(b"trace seg 1".len())
-        .any(|w| w == b"trace seg 1");
-    check!(has_seg0);
-    check!(has_seg1);
+    // The on-disk file is gzip(b"trace seg 0"); served verbatim.
+    check!(body.as_ref() == gzip_bytes(b"trace seg 0").as_slice());
 }
 
 #[tokio::test]
-async fn local_trace_not_found() {
+async fn local_object_not_found() {
     let dir = setup_local_dir();
     let base = start_server(local_state(dir.path())).await;
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/trace?keys=nonexistent.bin"))
+        .get(format!("{base}/api/object?key=nonexistent.bin"))
         .send()
         .await
         .unwrap();
-    check!(resp.status().as_u16() == 500);
+    check!(resp.status().as_u16() == 404);
+}
+
+#[tokio::test]
+async fn local_object_path_traversal_rejected() {
+    let dir = setup_local_dir();
+    let base = start_server(local_state(dir.path())).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/object?key=../../../etc/passwd"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() != 200);
 }
 
 #[tokio::test]
@@ -610,103 +1007,610 @@ async fn local_prefixes_lists_subdirs() {
     check!(resp.contains(&"2026-04-09/1920/".to_string()));
 }
 
+/// In local mode (allow_byo_creds=false), browse does a flat mtime-based
+/// listing and finds on-disk buffer traces regardless of path structure.
 #[tokio::test]
-async fn local_e2e_search_then_view() {
-    let dir = setup_local_dir();
-    let base = start_server(local_state(dir.path())).await;
+async fn browse_local_mode_finds_buffer_traces() {
+    let dir = tempfile::tempdir().unwrap();
+    let boot_dir = dir.path().join("aczi-148206");
+    std::fs::create_dir_all(&boot_dir).unwrap();
+    std::fs::write(boot_dir.join("trace.0.bin"), b"TRC\0fake-trace").unwrap();
+    std::fs::write(boot_dir.join("trace.1.bin"), b"TRC\0fake-trace-2").unwrap();
+    std::fs::write(boot_dir.join(".lock"), b"").unwrap();
+
+    let boot_dir2 = dir.path().join("bxyz-999999");
+    std::fs::create_dir_all(&boot_dir2).unwrap();
+    std::fs::write(boot_dir2.join("trace.0.bin.gz"), gzip_bytes(b"TRC\0other")).unwrap();
+
+    // No with_byo_creds → local mode → flat listing
+    let state = AppState::new(
+        Arc::new(LocalBackend::new(dir.path())),
+        Some("local".into()),
+        None,
+    );
+    let base = start_server(state).await;
     let client = reqwest::Client::new();
 
-    // Search for segments in the 1910 time bucket
-    let search_resp: Vec<ObjectInfo> = client
-        .get(format!("{base}/api/search?q=2026-04-09/1910/"))
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let resp = client
+        .get(format!(
+            "{base}/api/browse?bucket=local&from={}&to={}",
+            now - 86400,
+            now + 60
+        ))
         .send()
         .await
-        .unwrap()
-        .json()
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let objects = body["objects"].as_array().unwrap();
+
+    check!(
+        objects.len() == 3,
+        "expected 3 traces, got {}",
+        objects.len()
+    );
+    let keys: Vec<&str> = objects.iter().map(|o| o["key"].as_str().unwrap()).collect();
+    check!(keys.contains(&"aczi-148206/trace.0.bin"));
+    check!(keys.contains(&"aczi-148206/trace.1.bin"));
+    check!(keys.contains(&"bxyz-999999/trace.0.bin.gz"));
+}
+
+// --- trace upload tests ---
+
+/// A minimal but valid trace prefix: the `TRC\0` magic the upload validator
+/// looks for. The bytes after it don't matter for the upload path (the viewer
+/// decodes client-side), so we just need recognizable content to round-trip.
+const TRACE_MAGIC_BYTES: &[u8] = b"TRC\0sample-trace-bytes";
+
+/// An `AppState` with the (opt-in) upload feature enabled at default caps.
+fn upload_state() -> AppState {
+    AppState::new(Arc::new(FakeBackend), None, None).with_uploads(UploadLimits::default())
+}
+
+/// Uploads are opt-in: without `.with_uploads(...)` (i.e. no `--enable-upload`),
+/// the upload routes are not registered and both endpoints 404.
+#[tokio::test]
+async fn upload_disabled_by_default() {
+    let state = AppState::new(Arc::new(FakeBackend), None, None);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    let post = client
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
         .await
         .unwrap();
-    check!(search_resp.len() == 2);
+    check!(post.status().as_u16() == 404);
 
-    // Build trace URL from search results
-    let keys_param: String = search_resp
-        .iter()
-        .map(|o| format!("keys={}", urlencoding::encode(&o.key)))
-        .collect::<Vec<_>>()
-        .join("&");
+    let get = client
+        .get(format!("{base}/api/uploaded/anything"))
+        .send()
+        .await
+        .unwrap();
+    check!(get.status().as_u16() == 404);
+}
+
+/// POST a trace, then GET it back via the returned `trace_url`. The bytes must
+/// survive verbatim.
+#[tokio::test]
+async fn upload_round_trips() {
+    let base = start_server(upload_state()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let trace_url = body["trace_url"].as_str().unwrap();
+    check!(body["id"].as_str().is_some());
+    check!(trace_url.starts_with("/api/uploaded/"));
+    // viewer_url points the viewer at the trace via the existing ?trace= param.
+    check!(
+        body["viewer_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("/viewer.html?trace=%2Fapi%2Fuploaded%2F")
+    );
 
     let trace_resp = client
-        .get(format!("{base}/api/trace?{keys_param}"))
+        .get(format!("{base}{trace_url}"))
         .send()
         .await
         .unwrap();
     check!(trace_resp.status().as_u16() == 200);
-
-    let body = trace_resp.bytes().await.unwrap();
-    // Both segments present (decompressed)
-    let body_slice = body.as_ref();
-    let has_seg0 = body_slice
-        .windows(b"trace seg 0".len())
-        .any(|w| w == b"trace seg 0");
-    let has_seg1 = body_slice
-        .windows(b"trace seg 1".len())
-        .any(|w| w == b"trace seg 1");
-    check!(has_seg0);
-    check!(has_seg1);
+    let fetched = trace_resp.bytes().await.unwrap();
+    check!(fetched.as_ref() == TRACE_MAGIC_BYTES);
 }
 
+/// The second GET of an uploaded trace 404s — uploads are single-use.
 #[tokio::test]
-async fn local_search_empty_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = start_server(local_state(dir.path())).await;
+async fn upload_is_single_use() {
+    let base = start_server(upload_state()).await;
     let client = reqwest::Client::new();
 
-    let resp: Vec<ObjectInfo> = client
-        .get(format!("{base}/api/search"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    check!(resp.is_empty());
-}
-
-#[tokio::test]
-async fn local_search_returns_file_sizes() {
-    let dir = tempfile::tempdir().unwrap();
-    let data = b"hello world";
-    std::fs::write(dir.path().join("test.bin"), data).unwrap();
-
-    let base = start_server(local_state(dir.path())).await;
-    let client = reqwest::Client::new();
-
-    let resp: Vec<ObjectInfo> = client
-        .get(format!("{base}/api/search"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    check!(resp.len() == 1);
-    check!(resp[0].key == "test.bin");
-    check!(resp[0].size == data.len() as i64);
-}
-
-#[tokio::test]
-async fn local_path_traversal_rejected() {
-    let dir = setup_local_dir();
-    let base = start_server(local_state(dir.path())).await;
-    let client = reqwest::Client::new();
-
-    // Attempt to escape root via ../
     let resp = client
-        .get(format!("{base}/api/trace?keys=../../../etc/passwd"))
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
         .send()
         .await
         .unwrap();
-    // Should fail — either not found or error, but not 200
-    check!(resp.status().as_u16() != 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let trace_url = body["trace_url"].as_str().unwrap().to_string();
+
+    let first = client
+        .get(format!("{base}{trace_url}"))
+        .send()
+        .await
+        .unwrap();
+    check!(first.status().as_u16() == 200);
+
+    let second = client
+        .get(format!("{base}{trace_url}"))
+        .send()
+        .await
+        .unwrap();
+    check!(second.status().as_u16() == 404);
+}
+
+/// GET of an id that was never uploaded 404s.
+#[tokio::test]
+async fn uploaded_unknown_id_not_found() {
+    let base = start_server(upload_state()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/uploaded/does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 404);
+}
+
+/// Empty bodies and bytes lacking the gzip/`TRC\0` magic are rejected with 400.
+#[tokio::test]
+async fn upload_rejects_invalid_bodies() {
+    let base = start_server(upload_state()).await;
+    let client = reqwest::Client::new();
+
+    let empty = client
+        .post(format!("{base}/api/upload"))
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    check!(empty.status().as_u16() == 400);
+
+    let junk = client
+        .post(format!("{base}/api/upload"))
+        .body(b"not a trace at all".to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(junk.status().as_u16() == 400);
+}
+
+/// A gzipped body is accepted (matches how traces are stored on the wire).
+#[tokio::test]
+async fn upload_accepts_gzipped_body() {
+    let base = start_server(upload_state()).await;
+    let client = reqwest::Client::new();
+
+    let gz = gzip_bytes(b"TRC\0whatever");
+    let resp = client
+        .post(format!("{base}/api/upload"))
+        .body(gz.clone())
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+
+    // Stored verbatim: the bytes come back gzipped, the viewer gunzips client-side.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let trace_url = body["trace_url"].as_str().unwrap();
+    let fetched = client
+        .get(format!("{base}{trace_url}"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    check!(fetched.as_ref() == gz.as_slice());
+}
+
+/// A body larger than the per-upload limit is rejected by the body-limit layer
+/// (413 Payload Too Large).
+#[tokio::test]
+async fn upload_rejects_oversized_body() {
+    let limits = UploadLimits::builder().max_upload_bytes(64).build();
+    let state = AppState::new(Arc::new(FakeBackend), None, None).with_uploads(limits);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    let mut big = b"TRC\0".to_vec();
+    big.resize(256, 0);
+    let resp = client
+        .post(format!("{base}/api/upload"))
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 413);
+}
+
+/// Once the count cap is reached, further uploads are rejected with 507.
+#[tokio::test]
+async fn upload_rejects_when_full() {
+    let limits = UploadLimits::builder().max_uploads(1).build();
+    let state = AppState::new(Arc::new(FakeBackend), None, None).with_uploads(limits);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(first.status().as_u16() == 200);
+
+    let second = client
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(second.status().as_u16() == 507);
+}
+
+/// Once the total-bytes cap is reached, further uploads are rejected with 507
+/// (exercises the byte cap over HTTP, distinct from the count cap above).
+#[tokio::test]
+async fn upload_rejects_when_total_bytes_full() {
+    // Big enough per-upload limit to accept one body, but a tiny total budget
+    // so the second body tips it over.
+    let limits = UploadLimits::builder()
+        .max_total_bytes(TRACE_MAGIC_BYTES.len())
+        .build();
+    let state = AppState::new(Arc::new(FakeBackend), None, None).with_uploads(limits);
+    let base = start_server(state).await;
+    let client = reqwest::Client::new();
+
+    let first = client
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(first.status().as_u16() == 200);
+
+    // Without fetching the first (which would free its bytes), the second 507s.
+    let second = client
+        .post(format!("{base}/api/upload"))
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(second.status().as_u16() == 507);
+}
+
+/// A cross-origin preflight (OPTIONS) is answered with permissive CORS headers,
+/// and the actual POST response carries `access-control-allow-origin`.
+#[tokio::test]
+async fn upload_supports_cors() {
+    let base = start_server(upload_state()).await;
+    let client = reqwest::Client::new();
+
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, format!("{base}/api/upload"))
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "POST")
+        .send()
+        .await
+        .unwrap();
+    check!(preflight.status().is_success());
+    check!(
+        preflight
+            .headers()
+            .contains_key("access-control-allow-origin")
+    );
+
+    let posted = client
+        .post(format!("{base}/api/upload"))
+        .header("Origin", "https://example.com")
+        .body(TRACE_MAGIC_BYTES.to_vec())
+        .send()
+        .await
+        .unwrap();
+    check!(posted.status().as_u16() == 200);
+    check!(posted.headers().contains_key("access-control-allow-origin"));
+}
+
+// --- assume-role path tests ---
+
+const H_ROLE_ARN: &str = "x-dial9-aws-role-arn";
+
+use dial9_viewer::server::credentials::{AssumeRoleError, RoleArn, RoleAssumer, TempCredentials};
+use std::sync::Mutex;
+
+/// Fake [`RoleAssumer`] that mints the s3s fake's static "test"/"test"
+/// credentials (so the resulting ephemeral S3 client talks to the same in-process
+/// fake the BYOC tests use) WITHOUT a real STS call. Records the ARN it was asked
+/// to assume so a test can assert the header reached the assumer.
+struct FakeRoleAssumer {
+    assumed: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeRoleAssumer {
+    fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+        let assumed = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                assumed: Arc::clone(&assumed),
+            },
+            assumed,
+        )
+    }
+}
+
+impl RoleAssumer for FakeRoleAssumer {
+    fn assume_role<'a>(
+        &'a self,
+        role_arn: &'a RoleArn,
+        region: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TempCredentials, AssumeRoleError>> + Send + 'a>,
+    > {
+        self.assumed
+            .lock()
+            .unwrap()
+            .push(role_arn.as_str().to_string());
+        let region = region.map(str::to_string);
+        Box::pin(async move {
+            // Same static creds the s3s fake's SimpleAuth accepts.
+            Ok(TempCredentials::new(
+                "test",
+                "test",
+                Some("token".into()),
+                region,
+            ))
+        })
+    }
+}
+
+/// A [`RoleAssumer`] that always fails — proves an STS failure maps to 401.
+struct FailingRoleAssumer;
+
+impl RoleAssumer for FailingRoleAssumer {
+    fn assume_role<'a>(
+        &'a self,
+        _role_arn: &'a RoleArn,
+        _region: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TempCredentials, AssumeRoleError>> + Send + 'a>,
+    > {
+        Box::pin(async { Err(AssumeRoleError("access denied (fake)".into())) })
+    }
+}
+
+/// BYO server with an assumer wired: the default backend errors, so a successful
+/// data response proves the assumed-role ephemeral backend served it.
+async fn setup_assume_role_test(
+    bucket: &str,
+) -> (String, tempfile::TempDir, Arc<Mutex<Vec<String>>>) {
+    let s3_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(s3_root.path().join(bucket)).unwrap();
+    let (assumer, assumed) = FakeRoleAssumer::new();
+
+    let state = AppState::new(Arc::new(ErroringBackend), Some(bucket.to_string()), None)
+        .with_byo_creds(true)
+        .with_ephemeral_s3(fake_ephemeral_config(s3_root.path()))
+        .with_role_assumer(Arc::new(assumer));
+    let base = start_server(state).await;
+    (base, s3_root, assumed)
+}
+
+#[tokio::test]
+async fn assume_role_lists_bucket_via_assumed_creds() {
+    // A role-arn request: the viewer assumes the role (fake), then lists buckets
+    // through the resulting ephemeral backend (the s3s fake). The erroring
+    // default backend would 500, so a 200 proves the assumed path served it.
+    let (base, _dir, assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .header(H_ROLE_ARN, "arn:aws:iam::123456789012:role/dial9-reader")
+        .header(H_REGION, "us-east-1")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let names: Vec<String> = resp.json().await.unwrap();
+    check!(names.contains(&"byo-bucket".to_string()));
+    // The exact ARN from the header reached the assumer.
+    let assumed = assumed.lock().unwrap();
+    check!(assumed.as_slice() == ["arn:aws:iam::123456789012:role/dial9-reader"]);
+}
+
+#[tokio::test]
+async fn assume_role_via_query_params_is_linkable() {
+    // The whole point of the query-param path: a plain GET URL (no headers) with
+    // ?aws_role_arn=…&aws_region=… reads through the assumed role. reqwest's
+    // .query() percent-encodes the ARN's colons/slashes for us.
+    let (base, _dir, assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .query(&[
+            (
+                "aws_role_arn",
+                "arn:aws:iam::123456789012:role/dial9-reader",
+            ),
+            ("aws_region", "us-east-1"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let names: Vec<String> = resp.json().await.unwrap();
+    check!(names.contains(&"byo-bucket".to_string()));
+    let assumed = assumed.lock().unwrap();
+    check!(assumed.as_slice() == ["arn:aws:iam::123456789012:role/dial9-reader"]);
+}
+
+#[tokio::test]
+async fn invalid_role_arn_in_query_is_400() {
+    let (base, _dir, _assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .query(&[("aws_role_arn", "not-an-arn")])
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+#[tokio::test]
+async fn assume_role_without_assumer_is_rejected() {
+    // BYO enabled but NO assumer wired → a role-arn request is a 400 (feature
+    // off here), not a silent fallback to the ambient/default backend.
+    let (_s3, base, _dir) = setup_byo_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .header(H_ROLE_ARN, "arn:aws:iam::123456789012:role/dial9-reader")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+#[tokio::test]
+async fn assume_role_failure_maps_to_401() {
+    // STS failure → 401, and the body never echoes the role/account/SDK text.
+    let s3_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(s3_root.path().join("byo-bucket")).unwrap();
+    let state = AppState::new(Arc::new(ErroringBackend), Some("byo-bucket".into()), None)
+        .with_byo_creds(true)
+        .with_ephemeral_s3(fake_ephemeral_config(s3_root.path()))
+        .with_role_assumer(Arc::new(FailingRoleAssumer));
+    let base = start_server(state).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .header(H_ROLE_ARN, "arn:aws:iam::123456789012:role/dial9-reader")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 401);
+    let body = resp.text().await.unwrap();
+    check!(!body.contains("123456789012"));
+    check!(!body.contains("access denied (fake)"));
+}
+
+#[tokio::test]
+async fn byoc_and_role_arn_together_is_400() {
+    // Supplying both transports is the ambiguous combination → 400.
+    let (base, _dir, _assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .header(H_AKID, "test")
+        .header(H_SECRET, "test")
+        .header(H_ROLE_ARN, "arn:aws:iam::123456789012:role/dial9-reader")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+#[tokio::test]
+async fn invalid_role_arn_is_400() {
+    let (base, _dir, _assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/buckets"))
+        .header(H_ROLE_ARN, "not-an-arn")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 400);
+}
+
+#[tokio::test]
+async fn config_reports_assume_role_support() {
+    // With an assumer wired, /api/config advertises supports_assume_role: true.
+    let (base, _dir, _assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    check!(resp["supports_assume_role"] == true);
+
+    // Without one (plain BYO), it is false.
+    let (_s3, base2, _dir2) = setup_byo_test("byo-bucket").await;
+    let resp2: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base2}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    check!(resp2["supports_assume_role"] == false);
+}
+
+#[tokio::test]
+async fn credentials_check_succeeds_via_assumed_role() {
+    // /api/credentials/check has its own assume path; exercise it. The fake
+    // assumer mints the s3s creds, HeadBucket against the fake succeeds → ok.
+    let (base, _dir, assumed) = setup_assume_role_test("byo-bucket").await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/credentials/check?bucket=byo-bucket"))
+        .header(H_ROLE_ARN, "arn:aws:iam::123456789012:role/dial9-reader")
+        .header(H_REGION, "us-east-1")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    check!(body["ok"] == true);
+    // The check actually went through the assume path, not BYOC.
+    check!(assumed.lock().unwrap().len() == 1);
+}
+
+#[tokio::test]
+async fn credentials_check_assume_role_failure_maps_to_401() {
+    // check shares AppState::assume, so an STS failure here is a 401 with no
+    // account/SDK leak — same policy as the data path.
+    let s3_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(s3_root.path().join("byo-bucket")).unwrap();
+    let state = AppState::new(Arc::new(ErroringBackend), Some("byo-bucket".into()), None)
+        .with_byo_creds(true)
+        .with_ephemeral_s3(fake_ephemeral_config(s3_root.path()))
+        .with_role_assumer(Arc::new(FailingRoleAssumer));
+    let base = start_server(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/credentials/check?bucket=byo-bucket"))
+        .header(H_ROLE_ARN, "arn:aws:iam::123456789012:role/dial9-reader")
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 401);
+    let body = resp.text().await.unwrap();
+    check!(!body.contains("123456789012"));
+    check!(!body.contains("access denied (fake)"));
 }
 
 #[cfg(test)]
@@ -894,4 +1798,80 @@ mod skills_unpack_tests {
             .join("red_flag_scan.js");
         assert!(red_flags_script.exists());
     }
+}
+
+// --- router composition: downstream embedders can customize the server ---
+
+/// An embedder can merge custom routes onto the router returned by
+/// `server::router()`.
+#[tokio::test]
+async fn router_supports_merged_routes() {
+    let state = AppState::new(Arc::new(FakeBackend), None, None);
+    let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let state = state.with_dev_ui_dir(ui_dir);
+
+    let app = router(state).merge(axum::Router::new().route(
+        "/api/feedback",
+        axum::routing::post(|| async { "feedback received" }),
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Custom route is reachable
+    let resp = client
+        .post(format!("{base}/api/feedback"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    check!(resp.text().await.unwrap() == "feedback received");
+
+    // Built-in route still works
+    let resp = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+}
+
+/// An embedder can layer middleware (e.g. auth) onto the router.
+#[tokio::test]
+async fn router_supports_middleware_layers() {
+    let state = AppState::new(Arc::new(FakeBackend), None, None);
+    let ui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+    let state = state.with_dev_ui_dir(ui_dir);
+
+    let app = router(state).layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let mut resp = next.run(req).await;
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("x-custom-embedder"),
+                axum::http::HeaderValue::from_static("my-internal-tool"),
+            );
+            resp
+        },
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap();
+    check!(resp.status().as_u16() == 200);
+    check!(resp.headers().get("x-custom-embedder").unwrap() == "my-internal-tool");
 }

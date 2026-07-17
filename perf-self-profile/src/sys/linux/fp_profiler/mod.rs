@@ -21,9 +21,9 @@ compile_error!(
 mod supported {
     #[cfg(not(target_os = "android"))]
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(not(target_os = "android"))]
     use std::sync::atomic::AtomicPtr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::SAFE_LOAD_FAULT;
 
@@ -273,19 +273,10 @@ mod supported {
         unsafe { try_fixup_safe_load(ucontext) }
     }
 
-    /// Whether the frame-pointer unwinder may walk frame pointers safely on
-    /// this platform. On Linux that means our SIGSEGV handler was installed
-    /// via `sigaction`. On Android that means we successfully registered with
-    /// libsigchain (without it, safe_load would crash on a bad FP read).
+    /// Whether the Android frame-pointer unwinder registered with libsigchain.
+    #[cfg(target_os = "android")]
     pub fn fp_unwind_supported() -> bool {
-        #[cfg(target_os = "android")]
-        {
-            SIGCHAIN_REGISTERED.load(Ordering::SeqCst)
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            HANDLER_INSTALLED.load(Ordering::SeqCst)
-        }
+        SIGCHAIN_REGISTERED.load(Ordering::SeqCst)
     }
 
     // Architecture-specific ucontext access
@@ -327,4 +318,6 @@ mod supported {
     }
 }
 
-pub use supported::{fp_unwind_supported, handler_is_installed, install_handler, load};
+#[cfg(target_os = "android")]
+pub use supported::fp_unwind_supported;
+pub use supported::{handler_is_installed, install_handler, load};
