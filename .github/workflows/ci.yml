@@ -69,18 +69,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ANDROID_API: "30"
-      NDK_VERSION: "27.3.13750724"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.STABLE_TOOLCHAIN }}
           targets: aarch64-linux-android
-      - name: Install Android NDK
-        run: sdkmanager --install "ndk;$NDK_VERSION"
       - name: Build CPU profiling example
         run: |
-          toolchain="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export AR="$toolchain/llvm-ar"
           export RANLIB="$toolchain/llvm-ranlib"
           export CC_aarch64_linux_android="$toolchain/aarch64-linux-android$ANDROID_API-clang"
