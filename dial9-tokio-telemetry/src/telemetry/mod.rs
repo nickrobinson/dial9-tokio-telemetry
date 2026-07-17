@@ -8,8 +8,22 @@ pub(crate) mod analysis;
 pub(crate) mod buffer;
 pub(crate) mod collector;
 pub use collector::Batch;
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 pub mod cpu_profile;
+#[cfg(all(feature = "cpu-profiling", not(target_arch = "aarch64")))]
+pub mod cpu_profile {
+    /// Dummy no-op mock for when targeting a `cpu-profiling`-incompatible platform.
+    #[derive(Default, Debug)]
+    pub struct CpuProfilingConfig {
+        _private: ()
+    }
+
+    /// Dummy no-op mock for when targeting a `cpu-profiling`-incompatible platform.
+    #[derive(Default, Debug)]
+    pub struct SchedEventConfig {
+        _private: ()
+    }
+}
 pub(crate) mod events;
 pub(crate) mod format;
 pub(crate) mod recorder;

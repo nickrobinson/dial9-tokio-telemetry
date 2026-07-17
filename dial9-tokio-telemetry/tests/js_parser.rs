@@ -37,7 +37,7 @@ fn test_js_parser_matches_rust() {
         let writer = RotatingWriter::single_file(&trace_path).unwrap();
         #[allow(unused_mut)]
         let mut tb = TracedRuntime::builder().with_task_tracking(true);
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         {
             tb = tb.with_cpu_profiling(
                 dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig::default(),
@@ -103,7 +103,7 @@ fn test_js_parser_matches_rust() {
 /// Verify that SymbolTableEntry frames at the end of a trace are still resolved
 /// even when the event cap is reached (i.e., the parser doesn't break out of
 /// the frame loop early and skip trailing metadata).
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 #[test]
 fn test_js_parser_resolves_symbols_past_event_cap() {
     use dial9_perf_self_profile::offline_symbolize::SymbolTableEntry;

@@ -355,7 +355,7 @@ impl PipelineBuilder {
     /// CPU profiling is on; on the custom path the pipeline is passed
     /// through verbatim, so chain `.symbolize()` first if you want
     /// symbolized stack frames in your trace files.
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     pub fn symbolize(mut self) -> Self {
         self.processors.push(Box::new(SymbolizeProcessor));
         self
@@ -502,11 +502,11 @@ impl SegmentProcessor for GzipCompressor {
 
 /// Resolves stack-frame addresses in the segment to symbol names using
 /// the current process's `/proc/self/maps`.
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 #[derive(Debug, Default)]
 pub(crate) struct SymbolizeProcessor;
 
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 impl SegmentProcessor for SymbolizeProcessor {
     fn name(&self) -> &'static str {
         "Symbolize"

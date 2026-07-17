@@ -1,0 +1,14 @@
+[toolchain]
+channel = "nightly-2026-01-15"
+profile = "minimal"
+components = [
+    "rust-src"
+]
+# I guess we could pull the targets to avoid having to use `-Zbuild-std`, but
+# we do need cross-compilation shenanigans either way, so we may as well reduce the setup.
+targets = [
+    # "aarch64-linux-android",
+    # "armv7-linux-androideabi",
+    # "i686-linux-android",
+    # "x86_64-linux-android",
+]

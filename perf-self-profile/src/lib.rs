@@ -36,6 +36,7 @@
 //!     println!("ip={:#x} callchain={} frames", sample.ip, sample.callchain.len());
 //! });
 //! ```
+#![cfg(target_arch = "aarch64")]
 
 pub mod offline_symbolize;
 mod sampler;

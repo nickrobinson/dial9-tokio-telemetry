@@ -304,7 +304,7 @@ struct RuntimeEnvConfig {
     task_tracking_enabled: bool,
     runtime_name: Option<String>,
     cpu_profile_enabled: bool,
-    #[cfg_attr(not(feature = "cpu-profiling"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "cpu-profiling", target_arch = "aarch64")), allow(dead_code))]
     cpu_sample_hz: Option<u64>,
     schedule_profile_enabled: bool,
     task_dump_enabled: bool,
@@ -531,7 +531,7 @@ fn apply_runtime_env<M>(
         runtime = runtime.with_task_dumps(task_dump_config);
     }
 
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     {
         use crate::telemetry::cpu_profile::{CpuProfilingConfig, SchedEventConfig};
 
@@ -547,7 +547,7 @@ fn apply_runtime_env<M>(
         }
     }
 
-    #[cfg(not(feature = "cpu-profiling"))]
+    #[cfg(not(all(feature = "cpu-profiling", target_arch = "aarch64")))]
     if config.cpu_profile_enabled || config.schedule_profile_enabled {
         warn(format_args!(
             "dial9: CPU/schedule profiling requested but `cpu-profiling` feature is not enabled; ignoring"

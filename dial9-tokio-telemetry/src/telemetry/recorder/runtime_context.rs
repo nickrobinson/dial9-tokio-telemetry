@@ -34,7 +34,7 @@ thread_local! {
     /// Whether we've registered this thread's worker_id mapping.
     static WORKER_REGISTERED: Cell<bool> = const { Cell::new(false) };
     /// Whether we've registered this thread's OS tid for CPU profiling.
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     static TID_REGISTERED: Cell<bool> = const { Cell::new(false) };
     /// Monotonic timestamp captured in `on_before_task_poll`, cleared in
     /// `on_after_task_poll`. Allows code running inside a poll (e.g.
@@ -118,9 +118,9 @@ impl RuntimeContext {
         GLOBAL_WORKER_ID.with(|cell| cell.set(Some(global_id)));
 
         register_worker_if_needed(self, local_index, global_id);
-        #[cfg(feature = "cpu-profiling")]
+        #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
         register_tid_if_needed(global_id, shared);
-        #[cfg(not(feature = "cpu-profiling"))]
+        #[cfg(not(all(feature = "cpu-profiling", target_arch = "aarch64")))]
         let _ = shared;
 
         Some((WorkerId::from(global_id as usize), local_index))
@@ -142,7 +142,7 @@ fn register_worker_if_needed(ctx: &RuntimeContext, local_index: usize, global_id
 
 /// Register the current thread's OS tid for CPU profiling (once per thread).
 /// Also starts sched event sampling for this worker thread.
-#[cfg(feature = "cpu-profiling")]
+#[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
 fn register_tid_if_needed(global_id: u64, shared: &SharedState) {
     TID_REGISTERED.with(|cell| {
         if !cell.get() {

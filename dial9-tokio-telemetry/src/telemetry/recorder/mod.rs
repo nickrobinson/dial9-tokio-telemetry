@@ -138,9 +138,9 @@ fn register_hooks(
     // callback per hook, so any feature-gated work must live here rather
     // than registering its own hook.
     let handle_for_tl = TelemetryHandle::enabled(shared.clone(), control_tx.clone());
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     let s_start = shared.clone();
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     let s_stop = shared.clone();
 
     builder
@@ -151,7 +151,7 @@ fn register_hooks(
                 *cell.borrow_mut() = Some(handle_for_tl.clone());
             });
 
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             {
                 // Register as Blocking initially; worker threads will
                 // overwrite this to Worker(i) in resolve_worker_id.
@@ -177,7 +177,7 @@ fn register_hooks(
                 *cell.borrow_mut() = None;
             });
 
-            #[cfg(feature = "cpu-profiling")]
+            #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
             {
                 let tid = crate::telemetry::events::current_tid();
                 s_stop.thread_roles.lock().unwrap().remove(&tid);
@@ -1565,7 +1565,7 @@ mod tests {
     /// Regression test: `TelemetryCore::builder()` with `cpu_profiling` but
     /// without `s3_config` must auto-wire the processor pipeline (symbolize +
     /// gzip + write-back) so the background worker is spawned.
-    #[cfg(feature = "cpu-profiling")]
+    #[cfg(all(feature = "cpu-profiling", target_arch = "aarch64"))]
     #[test]
     fn telemetry_core_builder_cpu_profiling_auto_wires_processors() {
         use crate::telemetry::cpu_profile::CpuProfilingConfig;
