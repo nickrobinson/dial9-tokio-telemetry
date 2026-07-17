@@ -14,9 +14,9 @@
 
 use dial9_tokio_telemetry::telemetry::{
     CpuProfilingConfig, DiskWriter, TracedRuntime,
+    analysis::TraceReader,
     analysis_events::{CpuSampleSource, Dial9Event, WorkerId},
 };
-use dial9_trace_format::decoder::Decoder;
 use std::time::Duration;
 
 fn burn_cpu(duration: Duration) {
@@ -40,16 +40,17 @@ async fn cpu_heavy_task(id: usize) {
 }
 
 fn main() {
-    // Base path without extension: writer produces cpu_profile_trace.0.bin,
-    // which the background worker can detect, symbolize, and gzip-compress.
-    let trace_base = "cpu_profile_trace.bin";
-    let segment_path = "cpu_profile_trace.0.bin";
+    // A unique base keeps repeated runs from reading a stale segment. The
+    // writer appends `.0.bin`, then the background worker symbolizes and
+    // gzip-compresses it.
+    let trace_base = format!("cpu_profile_trace_{}.bin", std::process::id());
+    let segment_path = format!("cpu_profile_trace_{}.0.bin.gz", std::process::id());
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(4).enable_all();
 
     let writer = DiskWriter::builder()
-        .base_path(trace_base)
+        .base_path(trace_base.clone())
         .max_file_size(1024 * 1024 * 20) // rotate after 20 MiB per file
         .max_total_size(1024 * 1024 * 100) // keep at most 100 MiB on disk
         .build()
@@ -83,39 +84,35 @@ fn main() {
 
     // Read back and report
     eprintln!("\n=== Reading trace from {segment_path} ===");
-    let data = std::fs::read(segment_path).unwrap();
-    let mut decoder = Decoder::new(&data).unwrap();
+    let trace = TraceReader::new(&segment_path).unwrap();
 
     let mut cpu_samples = 0usize;
     let mut polls = 0usize;
     let mut samples_by_worker: std::collections::HashMap<WorkerId, usize> =
         std::collections::HashMap::new();
 
-    decoder
-        .for_each_event(|raw| {
-            let ev: Dial9Event = raw.deserialize().expect("deserialize");
-            match &ev {
-                Dial9Event::CpuSampleEvent(e) if e.source == CpuSampleSource::CpuProfile => {
-                    cpu_samples += 1;
-                    *samples_by_worker.entry(e.worker_id).or_default() += 1;
-                    if cpu_samples <= 10 {
-                        eprintln!(
-                            "  CpuSample: worker={} t={}ns source={:?} frames={}",
-                            e.worker_id,
-                            e.timestamp_ns,
-                            e.source,
-                            e.callchain.len()
-                        );
-                        for (i, addr) in e.callchain.iter().take(8).enumerate() {
-                            eprintln!("    [{i}] {addr:#x}");
-                        }
+    for ev in &trace.all_events {
+        match ev {
+            Dial9Event::CpuSampleEvent(e) if e.source == CpuSampleSource::CpuProfile => {
+                cpu_samples += 1;
+                *samples_by_worker.entry(e.worker_id).or_default() += 1;
+                if cpu_samples <= 10 {
+                    eprintln!(
+                        "  CpuSample: worker={} t={}ns source={:?} frames={}",
+                        e.worker_id,
+                        e.timestamp_ns,
+                        e.source,
+                        e.callchain.len()
+                    );
+                    for (i, addr) in e.callchain.iter().take(8).enumerate() {
+                        eprintln!("    [{i}] {addr:#x}");
                     }
                 }
-                Dial9Event::PollStartEvent(_) => polls += 1,
-                _ => {}
             }
-        })
-        .unwrap();
+            Dial9Event::PollStartEvent(_) => polls += 1,
+            _ => {}
+        }
+    }
 
     eprintln!("\nPoll starts: {polls}");
     eprintln!("CPU samples: {cpu_samples}");
