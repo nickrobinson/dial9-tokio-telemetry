@@ -45,6 +45,7 @@ impl PerfSampler {
     /// Start sampling using only the perf backend. No ctimer fallback.
     ///
     /// Returns an error if `perf_event_open` is blocked or fails for any reason.
+    #[allow(dead_code)]
     pub(crate) fn start_perf_only(config: SamplerConfig) -> io::Result<Self> {
         let perf = PerfSamplerImpl::start_for_pid(0, &config)?;
         Ok(Self {
@@ -56,6 +57,7 @@ impl PerfSampler {
     ///
     /// Only supports frequency-based sampling. Returns an error for
     /// period-based configurations.
+    #[allow(dead_code)]
     pub(crate) fn start_ctimer_only(config: SamplerConfig) -> io::Result<Self> {
         Self::with_ctimer_process_wide(&config)
     }
@@ -175,6 +177,7 @@ impl PerfSampler {
     }
 
     /// Create ctimer sampler and register the calling thread (process-wide mode).
+    #[allow(dead_code)]
     fn with_ctimer_process_wide(config: &SamplerConfig) -> io::Result<Self> {
         let mut sampler = Self::with_ctimer(config)?;
         sampler.track_current_thread()?;

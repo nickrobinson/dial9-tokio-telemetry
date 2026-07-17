@@ -64,6 +64,36 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+  android-aarch64-smoke:
+    name: Android aarch64 smoke
+    runs-on: macos-14
+    # Standard macOS ARM runners have no nested virtualization. Keep this
+    # experimental until emulator boot time and reliability are established.
+    continue-on-error: true
+    timeout-minutes: 30
+    env:
+      ANDROID_API: "30"
+      DIAL9_FORCE_CTIMER: "1"
+      NDK_VERSION: "27.3.13750724"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.STABLE_TOOLCHAIN }}
+          targets: aarch64-linux-android
+      - name: Run ctimer smoke test on Android
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 30
+          arch: arm64-v8a
+          target: default
+          ndk: ${{ env.NDK_VERSION }}
+          script: |
+            NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" \
+              CARGO_PKG=dial9-perf-self-profile \
+              EXAMPLE=basic \
+              examples/android_build.sh
+
   # TEMPORARY: the nightly build is disabled while aws-runtime fails to compile
   # on nightly rustc (E0282 type-inference regression upstream). This gate skips
   # `build-nightly` until 2026-07-20 (UTC), after which the job re-enables

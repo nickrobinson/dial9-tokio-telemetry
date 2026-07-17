@@ -22,10 +22,12 @@ impl PerfSampler {
         unsupported()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn start_perf_only(_config: SamplerConfig) -> io::Result<Self> {
         unsupported()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn start_ctimer_only(_config: SamplerConfig) -> io::Result<Self> {
         unsupported()
     }

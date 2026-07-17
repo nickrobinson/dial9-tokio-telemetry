@@ -1,4 +1,4 @@
-#/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 cd "$(dirname "$0")"/..
@@ -42,21 +42,30 @@ ANDROID_SERIAL="${ANDROID_SERIAL:-}" # Optional, to ensure `adb` commands are no
 CARGO_PKG="${CARGO_PKG:?missing. $(usage)}"
 EXAMPLE="${EXAMPLE:?missing. $(usage)}"
 PROFILE="${PROFILE:-release-with-debug}"
-FEATURES=${FEATURES:-} # e.g., -Fcpu-profiling
+FEATURE_ARGS=()
+if [[ -n "${FEATURES:-}" ]]; then
+    read -r -a FEATURE_ARGS <<< "${FEATURES}"
+fi
 
 TARGET="aarch64-linux-android" # Hard-coded
+ANDROID_API="${ANDROID_API:-21}"
 
 NDK_HOME="${NDK_HOME:?}"  # used to locate cross-compilation helpers
+TOOLCHAIN_BINS=("$NDK_HOME"/toolchains/llvm/prebuilt/*/bin)
+TOOLCHAIN_BIN="${TOOLCHAIN_BINS[0]}"
 
-export AR="$(find $NDK_HOME -name "llvm-ar" -type f | head -n1)"
-export RANLIB="$(find $NDK_HOME -name "llvm-ranlib" -type f | head -n1)"
-
-export CC_aarch64_linux_android="$(find $NDK_HOME -name "aarch64-linux-android*-clang" -type f | head -n1)"
+export AR="$TOOLCHAIN_BIN/llvm-ar"
+export RANLIB="$TOOLCHAIN_BIN/llvm-ranlib"
+export CC_aarch64_linux_android="$TOOLCHAIN_BIN/aarch64-linux-android${ANDROID_API}-clang"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${CC_aarch64_linux_android}"
+
+if [[ ! -x "$AR" || ! -x "$RANLIB" || ! -x "$CC_aarch64_linux_android" ]]; then
+    echo "Android NDK toolchain not found under $TOOLCHAIN_BIN" >&2
+    exit 1
+fi
 
 # Cargo build
 
-# Tested with cargo 1.95.0-nightly (85eff7c80 2026-01-15)
 CARGO_BUILD_CMD=(
     cargo build
         # The profile; `release` for speed, but `-with-debug` info attached
@@ -64,13 +73,11 @@ CARGO_BUILD_CMD=(
         # The package; ~ `Cargo.toml` file/dir
         -p "${CARGO_PKG}"
         # its features to be enabling
-        ${FEATURES}
+        "${FEATURE_ARGS[@]}"
         # The specific `examples/${EXAMPLE}.rs` file to be targeting
         --example "${EXAMPLE}"
         # We are cross-compiling to `aarch64-linux-android`
         --target "${TARGET}"
-        # This may require recompiling the stdlib
-        -Zbuild-std
 ); "${CARGO_BUILD_CMD[@]}"
 
 # ADB
@@ -80,7 +87,13 @@ adb push \
     /data/local/tmp/ \
 ;
 
-adb shell "cd /data/local/tmp && './$EXAMPLE'; echo Files:; ls \$PWD/*; echo" >&2
+if [[ -n "${DIAL9_FORCE_CTIMER:-}" ]]; then
+    adb shell "cd /data/local/tmp && DIAL9_FORCE_CTIMER=1 './$EXAMPLE'" >&2
+else
+    adb shell "cd /data/local/tmp && './$EXAMPLE'" >&2
+fi
+
+adb shell "cd /data/local/tmp && echo Files: && ls \$PWD/* && echo" >&2
 
 { set +x; } 2>/dev/null
 
