@@ -198,12 +198,11 @@ extern "C" fn sigprof_handler(
         // Unwind into the slot's frame buffer.
         //
         // On Android, the safe_load SIGSEGV recovery used by the
-        // frame-pointer unwinder only works if we registered with
-        // `libsigchain` (ART's signal-chaining library) via
-        // `AddSpecialSignalHandlerFn`. If that succeeded we can walk frame
-        // pointers safely; otherwise libsigchain owns SIGSEGV and a bad FP
-        // read would crash the process, so we degrade to a single-PC sample
-        // — still useful for identifying hot functions in the viewer.
+        // frame-pointer unwinder only works if safe_load faults can be
+        // recovered. Android apps register through `libsigchain` (ART's
+        // signal-chaining library); standalone native processes install the
+        // handler directly. Otherwise a bad FP read could crash the process,
+        // so we degrade to a single-PC sample.
         //
         // We also can't use `libc::ucontext_t` on Android because the
         // libc crate's struct is missing the 120-byte `__padding` between

@@ -41,7 +41,6 @@ pwd
 ANDROID_SERIAL="${ANDROID_SERIAL:-}" # Optional, to ensure `adb` commands are not ambiguous
 CARGO_PKG="${CARGO_PKG:?missing. $(usage)}"
 EXAMPLE="${EXAMPLE:?missing. $(usage)}"
-PROFILE="${PROFILE:-release-with-debug}"
 FEATURE_ARGS=()
 if [[ -n "${FEATURES:-}" ]]; then
     read -r -a FEATURE_ARGS <<< "${FEATURES}"
@@ -68,8 +67,6 @@ fi
 
 CARGO_BUILD_CMD=(
     cargo build
-        # The profile; `release` for speed, but `-with-debug` info attached
-        --profile "${PROFILE}"
         # The package; ~ `Cargo.toml` file/dir
         -p "${CARGO_PKG}"
         # its features to be enabling
