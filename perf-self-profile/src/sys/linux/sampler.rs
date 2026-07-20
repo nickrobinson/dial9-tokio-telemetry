@@ -45,7 +45,7 @@ impl PerfSampler {
     /// Start sampling using only the perf backend. No ctimer fallback.
     ///
     /// Returns an error if `perf_event_open` is blocked or fails for any reason.
-    #[cfg(feature = "dial9-source")]
+    #[cfg(feature = "cpu-profiling")]
     pub(crate) fn start_perf_only(config: SamplerConfig) -> io::Result<Self> {
         let perf = PerfSamplerImpl::start_for_pid(0, &config)?;
         Ok(Self {
@@ -57,7 +57,7 @@ impl PerfSampler {
     ///
     /// Only supports frequency-based sampling. Returns an error for
     /// period-based configurations.
-    #[cfg(feature = "dial9-source")]
+    #[cfg(feature = "cpu-profiling")]
     pub(crate) fn start_ctimer_only(config: SamplerConfig) -> io::Result<Self> {
         Self::with_ctimer_process_wide(&config)
     }

@@ -229,7 +229,7 @@ impl std::fmt::Debug for OfflineSymbolizer {
 ))]
 mod imp {
     use super::{FxHashSet, MapsEntry, collect_stack_frame_addresses};
-    use crate::rate_limit::rate_limited;
+    use dial9_core::rate_limited;
     use dial9_trace_format::decoder::Decoder;
     use std::io;
     use std::panic::AssertUnwindSafe;
