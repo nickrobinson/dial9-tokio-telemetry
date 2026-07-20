@@ -80,7 +80,7 @@ CARGO_BUILD_CMD=(
 # ADB
 
 adb push \
-    "target/$TARGET/$PROFILE/examples/$EXAMPLE" \
+    "target/$TARGET/debug/examples/$EXAMPLE" \
     /data/local/tmp/ \
 ;
 
