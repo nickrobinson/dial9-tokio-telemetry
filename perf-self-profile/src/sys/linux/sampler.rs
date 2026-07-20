@@ -59,7 +59,7 @@ impl PerfSampler {
     /// period-based configurations.
     #[cfg(feature = "cpu-profiling")]
     pub(crate) fn start_ctimer_only(config: SamplerConfig) -> io::Result<Self> {
-        Self::with_ctimer_process_wide(&config)
+        Self::ctimer_fallback(&config)
     }
 
     /// Start sampling a specific process.
@@ -177,7 +177,7 @@ impl PerfSampler {
     }
 
     /// Create ctimer sampler and register the calling thread (process-wide mode).
-    #[cfg(any(target_os = "linux", feature = "cpu-profiling"))]
+    #[cfg(target_os = "linux")]
     fn with_ctimer_process_wide(config: &SamplerConfig) -> io::Result<Self> {
         let mut sampler = Self::with_ctimer(config)?;
         sampler.track_current_thread()?;
