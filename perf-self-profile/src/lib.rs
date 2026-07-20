@@ -41,7 +41,7 @@
 //!
 //! With the `memory-profiling` feature, the `memory_profiling` module adds a
 //! sampled allocation profiler: set `Dial9Allocator` as the global allocator
-//! and register it with a dial9 session via `MemoryProfiler::install`.
+//! and register it with a dial9 recorder via `MemoryProfiler::install`.
 //! Sampled allocations land in the trace as `AllocEvent`/`FreeEvent`.
 //!
 //! ```ignore
@@ -50,23 +50,39 @@
 //! #[global_allocator]
 //! static ALLOC: Dial9Allocator = Dial9Allocator::system();
 //!
-//! // `handle` is a dial9 session handle (dial9_core::handle::Dial9Handle).
+//! // `handle` is a dial9 handle (dial9_core::handle::Dial9Handle).
 //! MemoryProfiler::with_defaults().install(handle)?;
 //! ```
 
 pub mod offline_symbolize;
-mod rate_limit;
 mod sampler;
 mod symbolize;
 mod sys;
 pub mod tracepoint;
 pub mod unwinder;
 
-#[cfg(feature = "dial9-source")]
+#[cfg(feature = "cpu-profiling")]
 pub mod cpu_source;
+
+#[cfg(any(
+    feature = "cpu-profiling",
+    feature = "memory-profiling",
+    feature = "process-resource",
+    feature = "linux-socket"
+))]
+pub mod recorder_ext;
+
+#[cfg(feature = "process-resource")]
+pub mod process_resource;
+
+#[cfg(feature = "linux-socket")]
+pub mod socket_accept_queues;
 
 #[cfg(feature = "memory-profiling")]
 pub mod memory_profiling;
+
+#[cfg(feature = "symbolize-processor")]
+pub mod symbolize_processor;
 
 pub use offline_symbolize::SymbolTableEntry;
 pub use sampler::{EventSource, Sample, SamplerConfig, SamplingMode};
@@ -110,16 +126,37 @@ pub fn unregister_current_thread() {
 #[cfg(target_os = "linux")]
 pub use sys::{resolve_symbol_with_maps, resolve_symbols_with_maps};
 
-#[cfg(feature = "dial9-source")]
+#[cfg(feature = "cpu-profiling")]
 pub use cpu_source::{
     CpuProfiler, CpuProfilingConfig, CpuSampleSource, SchedEventConfig, SchedProfiler,
 };
+
+#[cfg(any(
+    feature = "cpu-profiling",
+    feature = "memory-profiling",
+    feature = "process-resource",
+    feature = "linux-socket"
+))]
+pub use recorder_ext::RecorderPerfExt;
+
+#[cfg(all(feature = "process-resource", unix))]
+pub use process_resource::ProcessResourceUsageSource;
+#[cfg(feature = "process-resource")]
+pub use process_resource::{ProcessResourceUsageConfig, ProcessResourceUsageEvent};
+
+#[cfg(all(feature = "linux-socket", target_os = "linux"))]
+pub use socket_accept_queues::SocketAcceptQueuesSource;
+#[cfg(feature = "linux-socket")]
+pub use socket_accept_queues::{SocketAcceptQueuesConfig, TcpAcceptQueueEvent};
 
 #[cfg(feature = "memory-profiling")]
 pub use memory_profiling::{
     AllocEvent, DEFAULT_RING_CAPACITY, DEFAULT_SAMPLE_RATE_BYTES, Dial9Allocator, FreeEvent,
     InstallError, MemoryProfiler, MemoryProfilerGuard, MemoryProfilingConfig, is_installed,
 };
+
+#[cfg(feature = "symbolize-processor")]
+pub use symbolize_processor::SymbolizeProcessor;
 
 /// Internal module exposed only for benchmarks. Not part of the public API.
 #[cfg(all(target_os = "linux", feature = "__internal-bench"))]
