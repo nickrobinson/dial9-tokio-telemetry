@@ -1,7 +1,7 @@
 //! Linux offline symbolization using blazesym.
 
-use crate::rate_limit::rate_limited;
 use blazesym::symbolize::{Input, Symbolized, Symbolizer, source};
+use dial9_core::rate_limited;
 use dial9_trace_format::decoder::Decoder;
 use dial9_trace_format::encoder::{Encoder, FxBuildHasher, FxHashMap};
 use std::collections::HashSet;

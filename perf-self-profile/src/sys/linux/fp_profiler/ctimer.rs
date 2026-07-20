@@ -30,8 +30,8 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use crate::rate_limit::rate_limited;
 use crate::sys::linux::gettid;
+use dial9_core::rate_limited;
 
 use libc::{timer_create, timer_delete, timer_settime};
 

@@ -55,11 +55,6 @@
 //! ```
 
 pub mod offline_symbolize;
-#[cfg(any(
-    target_os = "linux",
-    all(target_os = "android", target_arch = "aarch64")
-))]
-mod rate_limit;
 mod sampler;
 mod symbolize;
 mod sys;

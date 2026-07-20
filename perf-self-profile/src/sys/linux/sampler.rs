@@ -177,7 +177,7 @@ impl PerfSampler {
     }
 
     /// Create ctimer sampler and register the calling thread (process-wide mode).
-    #[cfg(any(target_os = "linux", feature = "dial9-source"))]
+    #[cfg(any(target_os = "linux", feature = "cpu-profiling"))]
     fn with_ctimer_process_wide(config: &SamplerConfig) -> io::Result<Self> {
         let mut sampler = Self::with_ctimer(config)?;
         sampler.track_current_thread()?;
