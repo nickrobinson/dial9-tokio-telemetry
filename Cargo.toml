@@ -35,7 +35,3 @@ assert2 = "0.4"
 
 [profile.release]
 debug = 1
-
-[patch.crates-io]
-# TODO: remove after libc publishes the Android POSIX timer bindings added by this commit.
-libc = { git = "https://github.com/rust-lang/libc.git", rev = "51e1f84dbcad9e2e1b06634fb0825566c412c165" }

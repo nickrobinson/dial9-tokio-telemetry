@@ -3009,8 +3009,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.186"
-source = "git+https://github.com/rust-lang/libc.git?rev=51e1f84dbcad9e2e1b06634fb0825566c412c165#51e1f84dbcad9e2e1b06634fb0825566c412c165"
+version = "0.2.188"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22053b6a34f84abc97f9129e61334f40174659a1b9bd18c970b83db6a9a6348b"
 
 [[package]]
 name = "libm"
